@@ -4,6 +4,8 @@ Usage:
 python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fastchat-t5-3b-v1.0
 """
 import argparse
+from pyexpat import model
+import statistics
 
 from fastchat.utils import str_to_torch_dtype
 
@@ -32,6 +34,9 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
     model.past_key_values = past_key_values
     model.past_key_values_data = past_key_values_data
     model.current_length_data = current_length_data
+    
+    model.draft_kv_compress = statistics.get("draft_kv_compress", False)
+    model.draft_kv_retain_ratio = statistics.get("draft_kv_retain_ratio", 1.0)
 
     input_len = input_ids.shape[1]
     cur_length = input_len
@@ -111,6 +116,7 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
         swift_logits, top1_prob = swift_draft(
             model,
             input_ids=sample_token,
+            full_input_ids=input_ids,
             new_token_num=new_token_num,
             past_key_values_data=past_key_values_data,
             current_length_data=current_length_data,
@@ -249,6 +255,19 @@ if __name__ == "__main__":
         default=2024,
         help="The sampling seed.",
     )
+    parser.add_argument(
+        "--draft-kv-compress",
+        action="store_true",
+        default=False,
+        help="Whether to compress KV cache only during draft.",
+    )
+
+    parser.add_argument(
+        "--draft-kv-retain-ratio",
+        type=float,
+        default=1.0,
+        help="Retain ratio of KV cache during draft. 1.0 means no compression.",
+    )
 
     args = parser.parse_args()
 
@@ -298,7 +317,8 @@ if __name__ == "__main__":
                   "skip_ratio": args.skip_ratio, "acceptance_rate_list": [], "opt_interval": args.opt_interval,
                   "bayes_interval": args.bayes_interval, "max_opt_iter": args.max_opt_iter,
                   "max_tolerance_iter": args.max_tolerance_iter, "max_score": args.max_score,
-                  "context_window": args.context_window, "optimization": args.optimization, "bayes": args.bayes}
+                  "context_window": args.context_window, "optimization": args.optimization, "bayes": args.bayes,
+                  "draft_kv_compress": args.draft_kv_compress, "draft_kv_retain_ratio": args.draft_kv_retain_ratio}
 
     run_eval(
         model=model,

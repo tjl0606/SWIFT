@@ -328,6 +328,7 @@ def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key
         swift_logits, top1_prob = swift_draft(
             model,
             input_ids=sample_token,
+            full_input_ids=input_ids,
             past_key_values_data=past_key_values_data,
             current_length_data=current_length_data,
             max_new_tokens=max_new_tokens,
@@ -406,6 +407,7 @@ def sample(logits, logits_processor, k=1):
 def swift_draft(
         model,
         input_ids=None,
+        full_input_ids=None,
         new_token_num=0,
         past_key_values_data=None,
         current_length_data=None,
@@ -434,11 +436,24 @@ def swift_draft(
     - draft_logits (torch.Tensor): Logits associated with the draft steps.
     - top1_prob (float): Probability of the sampled token.
     """
-    draft_past_key_values_data = []
-    for i in range(len(past_key_values_data)):
-        draft_past_key_values_data.append(past_key_values_data[i].clone())
-    draft_current_length_data = current_length_data.clone()
-    draft_past_key_values = clone_past_key_values(model, draft_past_key_values_data, draft_current_length_data)
+    if hasattr(model, "draft_kv_compress") and model.draft_kv_compress and model.draft_kv_retain_ratio < 0.9999:
+        draft_past_key_values_data, draft_current_length_data, draft_past_key_values = rebuild_compressed_draft_cache(
+            model=model,
+            full_input_ids=full_input_ids,
+            past_key_values_data=past_key_values_data,
+            current_length_data=current_length_data,
+            retain_ratio=model.draft_kv_retain_ratio,
+            min_retain_tokens=16,
+            # sink_tokens=4,
+        )
+    else:
+        draft_past_key_values_data = []
+        for i in range(len(past_key_values_data)):
+            draft_past_key_values_data.append(past_key_values_data[i].clone())
+        draft_current_length_data = current_length_data.clone()
+        draft_past_key_values = clone_past_key_values(
+            model, draft_past_key_values_data, draft_current_length_data
+        )
 
     ss_token, ss_prob, ss_op, top1_prob = [], [], [], []
     with torch.inference_mode():
@@ -482,6 +497,143 @@ def reset_swift_mode(
     """
     model.model.swift_mask = None
 
+# def compress_draft_past_key_values_recent(
+#         past_key_values_data_list,
+#         current_length_data,
+#         retain_ratio=1.0,
+#         min_retain_tokens=16,
+# ):
+#     """
+#     Compress draft KV cache by keeping only the most recent tokens.
+#     This function modifies the cloned draft KV cache in-place.
+
+#     Args:
+#         past_key_values_data_list (list[torch.Tensor]):
+#             Each tensor has shape [2 * num_layers_on_device, batch, num_kv_heads, max_pos, head_dim]
+#         current_length_data (torch.Tensor):
+#             CPU tensor of shape [num_hidden_layers * 2]
+#         retain_ratio (float):
+#             Fraction of tokens to keep. 1.0 means no compression.
+#         min_retain_tokens (int):
+#             Minimum number of past tokens to retain.
+#     """
+#     if retain_ratio >= 0.9999:
+#         return
+
+#     num_entries = current_length_data.size(0)
+
+#     for kv_idx in range(num_entries):
+#         cur_len = current_length_data[kv_idx].item()
+
+#         if cur_len <= min_retain_tokens:
+#             continue
+
+#         keep_len = max(min_retain_tokens, int(cur_len * retain_ratio))
+#         keep_len = min(keep_len, cur_len)
+
+#         if keep_len == cur_len:
+#             continue
+
+#         start_idx = cur_len - keep_len
+
+#         # Figure out which tensor block and which local slot correspond to kv_idx
+#         # We scan through the per-device packed tensors in order.
+#         running = 0
+#         target_tensor = None
+#         local_idx = None
+#         for data in past_key_values_data_list:
+#             block_size = data.shape[0]  # number of packed k/v entries in this block
+#             if kv_idx < running + block_size:
+#                 target_tensor = data
+#                 local_idx = kv_idx - running
+#                 break
+#             running += block_size
+
+#         if target_tensor is None:
+#             raise RuntimeError(f"Cannot locate KV entry {kv_idx} in draft cache.")
+
+#         # target_tensor[local_idx] shape: [batch, num_kv_heads, max_pos, head_dim]
+#         # Keep only the most recent keep_len tokens by moving them to the front.
+#         src = target_tensor[local_idx, :, :, start_idx:cur_len, :].clone()
+#         target_tensor[local_idx, :, :, :keep_len, :].copy_(src)
+#         current_length_data[kv_idx].fill_(keep_len)
+
+def rebuild_compressed_draft_cache(
+        model,
+        full_input_ids,
+        past_key_values_data,
+        current_length_data,
+        retain_ratio=1.0,
+        min_retain_tokens=16,
+):
+    """
+    Rebuild a draft cache using only the most recent contiguous suffix tokens.
+
+    Args:
+        model: SWIFT model
+        full_input_ids: current full sequence, shape [1, seq_len]
+        past_key_values_data: original full cache tensors
+        current_length_data: original current lengths
+        retain_ratio: fraction of tokens to retain
+        min_retain_tokens: minimum number of retained tokens
+
+    Returns:
+        draft_past_key_values_data, draft_current_length_data, draft_past_key_values
+    """
+    full_len = full_input_ids.shape[1]
+    keep_len = max(min_retain_tokens, int(full_len * retain_ratio))
+    keep_len = min(keep_len, full_len)
+
+    # ratio = 1.0 時保留全部，應該與原始 SWIFT 對齊
+    if keep_len == full_len:
+        draft_past_key_values_data = []
+        for i in range(len(past_key_values_data)):
+            draft_past_key_values_data.append(past_key_values_data[i].clone())
+        draft_current_length_data = current_length_data.clone()
+        draft_past_key_values = clone_past_key_values(
+            model, draft_past_key_values_data, draft_current_length_data
+        )
+        return draft_past_key_values_data, draft_current_length_data, draft_past_key_values
+
+    # only recent contiguous suffix
+    # kept_input_ids = full_input_ids[:, -keep_len:]
+
+    # [FIX] Keep the first few "sink" tokens (e.g., BOS token and start of prompt)
+    # LLaMA models rely heavily on the initial tokens as attention sinks. 
+    # Dropping them causes catastrophic attention collapse, severely degrading logits 
+    # and acceptance rate even with just 1% compression.
+    sink_len = 4
+    if keep_len > sink_len and full_len > keep_len:
+        kept_input_ids = torch.cat([
+            full_input_ids[:, :sink_len],
+            full_input_ids[:, -(keep_len - sink_len):]
+        ], dim=1)
+    else:
+        kept_input_ids = full_input_ids[:, -keep_len:]
+
+    # 建一份新的 draft cache
+    draft_past_key_values_data = []
+    for i in range(len(past_key_values_data)):
+        x = past_key_values_data[i].clone()
+        x.zero_()
+        draft_past_key_values_data.append(x)
+
+    draft_current_length_data = current_length_data.clone()
+    draft_current_length_data.zero_()
+
+    draft_past_key_values = clone_past_key_values(
+        model, draft_past_key_values_data, draft_current_length_data
+    )
+
+    # 用保留下來的 recent suffix 重新 prefill draft cache
+    with torch.inference_mode():
+        swift_verify(
+            model,
+            input_ids=kept_input_ids,
+            past_key_values=draft_past_key_values,
+        )
+
+    return draft_past_key_values_data, draft_current_length_data, draft_past_key_values
 
 def reset_past_key_values(past_key_values):
     """
