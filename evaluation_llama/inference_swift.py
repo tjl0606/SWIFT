@@ -105,6 +105,7 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             swift_optimization(
                 model,
                 input_ids[:, input_len:],
+                input_ids[:, :input_len],  # full_input_ids
                 input_past_key_values_data,
                 input_current_length_data,
                 new_token_num,

@@ -928,7 +928,7 @@ def layer_random_search(num_skip_layers=34, num_hidden_layers=40):
     return attn_skip_layers, mlp_skip_layers
 
 
-def swift_optimization(model, output_ids, input_past_key_values_data,
+def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_data,
             input_current_length_data, new_token_num, statistics, optimizer=None, utility=None, position_ids=None):
     """
     Perform an optimization to find the optimal layer set for the model based on the draft matchness.
@@ -951,7 +951,17 @@ def swift_optimization(model, output_ids, input_past_key_values_data,
     for i in range(len(input_past_key_values_data)):
         cur_past_key_values_data.append(input_past_key_values_data[i].clone())
     cur_current_length_data = input_current_length_data.clone()
-    input_past_key_values = clone_past_key_values(model, cur_past_key_values_data, cur_current_length_data)
+
+    if statistics.get("draft_kv_compress", False) and statistics.get("draft_kv_retain_ratio", 1.0) < 0.9999:
+        cur_past_key_values_data, cur_current_length_data, input_past_key_values = rebuild_compressed_draft_cache(
+            model=model,
+            full_input_ids=full_input_ids,
+            past_key_values_data=cur_past_key_values_data,
+            current_length_data=cur_current_length_data,
+            retain_ratio=statistics["draft_kv_retain_ratio"],
+        )
+    else:
+        input_past_key_values = clone_past_key_values(model, cur_past_key_values_data, cur_current_length_data)
 
     # preserve original layer set
     origin_attn_skip_layer_id_set, origin_mlp_skip_layer_id_set = model.get_skip_layers()
