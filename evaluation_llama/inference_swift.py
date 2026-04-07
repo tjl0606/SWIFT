@@ -99,6 +99,31 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             sample_p
         )
 
+        try:
+            drafted_path = candidates[best_candidate].tolist()
+            accepted_path = drafted_path[:accept_length + 1]
+            
+            drafted_text = tokenizer.decode(drafted_path)
+            accepted_text = tokenizer.decode(accepted_path)
+            
+            log_entry = {
+                "step": idx,
+                "draft_kv_compress": model.draft_kv_compress,
+                "draft_kv_retain_ratio": model.draft_kv_retain_ratio,
+                "drafted_tokens": drafted_path,
+                "accepted_tokens": accepted_path,
+                "drafted_text": drafted_text,
+                "accepted_text": accepted_text,
+                "accept_length": int(accept_length)
+            }
+            
+            log_file = f"token_log_compress_{model.draft_kv_compress}_ratio_{model.draft_kv_retain_ratio}.jsonl"
+            with open(log_file, "a") as f:
+                import json
+                f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logging.error(f"Error logging tokens: {e}")
+
         # layer set optimization
         if (new_token_num > (statistics["context_window"] + 1) and statistics["optimization"]
                 and idx % statistics["opt_interval"] == 0):

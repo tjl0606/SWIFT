@@ -4,7 +4,7 @@ MODEL_PATH=/home/tjlin/models/Llama-2-7b-hf
 MODEL_NAME=llama-2-7b
 TEMP=0.0 # 0.2 for general tasks and 0.6 for code generation
 TOP_P=0.85 # 0.85 for general tasks and 0.95 for code generation
-DATA_NUM=100
+DATA_NUM=10
 SEED=2024
 GPU_DEVICES=0
 MAX_NEW_TOKENS=512
@@ -26,7 +26,7 @@ CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation_llama.inference_baselin
 CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation_llama.inference_swift --model-path $MODEL_PATH --model-id ${MODEL_NAME} \
   --temperature $TEMP --top-p ${TOP_P} --dtype $torch_dtype --task-name ${TASK_NAME} --data-num ${DATA_NUM} --max-new-tokens ${MAX_NEW_TOKENS} \
   --seed $SEED --context-window ${CONTEXT_WINDOW} --opt-interval ${OPT_INTERVAL} --bayes-interval ${BAYES_INTERVAL} --max-opt-iter ${MAX_OPT_ITER} \
-  --max-tolerance-iter ${MAX_TOLERANCE_ITER} --max-score ${MAX_SCORE} --skip-ratio ${SKIP_RATIO} --optimization --bayes --draft-kv-compress --draft-kv-retain-ratio 0.99 # --cache-hit 
+  --max-tolerance-iter ${MAX_TOLERANCE_ITER} --max-score ${MAX_SCORE} --skip-ratio ${SKIP_RATIO} --optimization --bayes --draft-kv-compress --draft-kv-retain-ratio 1.0 # --cache-hit 
 
 #Mean accepted tokens: 1.6295661557015455
 # Token acceptance rate: 0.6162089960238568
