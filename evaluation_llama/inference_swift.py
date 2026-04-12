@@ -117,7 +117,7 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
                 "accept_length": int(accept_length)
             }
             
-            log_file = f"token_log_compress_{model.draft_kv_compress}_ratio_{model.draft_kv_retain_ratio}.jsonl"
+            log_file = f"without_skipping_token_log_compress_{model.draft_kv_compress}_ratio_{model.draft_kv_retain_ratio}.jsonl"
             with open(log_file, "a") as f:
                 import json
                 f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
@@ -159,6 +159,71 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             break
     logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
     return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num
+
+
+    return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num
+
+
+def draft_only_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
+                  logits_processor=None, max_steps=512):
+    assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
+    input_ids = input_ids.clone()
+    
+    (
+        past_key_values,
+        past_key_values_data,
+        current_length_data,
+    ) = initialize_past_key_values(model.model)
+    model.past_key_values = past_key_values
+    model.past_key_values_data = past_key_values_data
+    model.current_length_data = current_length_data
+    
+    model.draft_kv_compress = statistics.get("draft_kv_compress", False)
+    model.draft_kv_retain_ratio = statistics.get("draft_kv_retain_ratio", 1.0)
+    
+    reset_swift_mode(model)
+    
+    with torch.inference_mode():
+        outputs, logits = swift_verify(model, input_ids, past_key_values=past_key_values)
+        if logits_processor is not None:
+            last_logits = logits[:, -1]
+            last_logits = logits_processor(None, last_logits)
+            probabilities = torch.nn.functional.softmax(last_logits, dim=1)
+            sample_token = torch.multinomial(probabilities, 1)
+        else:
+            sample_token = torch.argmax(logits[:, -1])[None, None]
+            
+        swift_logits, top1_prob = swift_draft(
+            model,
+            input_ids=sample_token,
+            full_input_ids=input_ids,
+            new_token_num=0,
+            past_key_values_data=past_key_values_data,
+            current_length_data=current_length_data,
+            max_new_tokens=max_new_tokens,
+            logits_processor=logits_processor,
+            max_step_draft=max_new_tokens,
+            stop_threshold=-1.0,
+        )
+        
+    (ss_token, ss_prob, ss_op) = swift_logits
+    drafted_tokens = []
+    for step_token in ss_token:
+        if len(step_token.shape) == 3:
+            tok = step_token[0, 0, 0].item()
+        else:
+            tok = step_token[0, 0].item()
+        drafted_tokens.append(tok)
+        if tok == tokenizer.eos_token_id:
+            break
+            
+    drafted_tensor = torch.tensor([drafted_tokens], dtype=torch.long, device=input_ids.device)
+    output_ids = torch.cat([input_ids, sample_token, drafted_tensor], dim=1)
+    
+    new_token_num = output_ids.shape[1] - input_ids.shape[1]
+    accept_length_list = [1] * new_token_num
+    
+    return output_ids, new_token_num, new_token_num, accept_length_list, new_token_num
 
 
 if __name__ == "__main__":
@@ -294,14 +359,21 @@ if __name__ == "__main__":
         default=1.0,
         help="Retain ratio of KV cache during draft. 1.0 means no compression.",
     )
+    parser.add_argument(
+        "--draft-only",
+        action="store_true",
+        default=False,
+        help="Use the draft model natively as the main model for decoding.",
+    )
 
     args = parser.parse_args()
 
     args.model_name = (args.model_id + "-swift-" + str(args.dtype)+ "-temp-" + str(args.temperature)
                        + "-top-p-" + str(args.top_p) + "-seed-" + str(args.seed) + "-max_new_tokens-" + str(args.max_new_tokens)+ "-opt_interval-" + str(args.opt_interval)
                        + "-bayes_interval-" + str(args.bayes_interval) + "-max_opt-" + str(args.max_opt_iter) + "-max_tolerance-" + str(args.max_tolerance_iter)
-                       + "-max_score-" + str(args.max_score) + "-context_window-" + str(args.context_window) + "-skip_ratio-" + str(args.skip_ratio))
-    answer_file = f"outputs/{args.task_name}/{args.task_name}_{args.data_num}/model_answer/{args.model_id}/{args.model_name}.jsonl"
+                       + "-max_score-" + str(args.max_score) + "-context_window-" + str(args.context_window) + "-skip_ratio-" + str(args.skip_ratio) + "-draft_kv_retain_ratio-" + str(args.draft_kv_retain_ratio)
+                       + ("-draft_only" if args.draft_only else ""))
+    answer_file = f"outputs/{args.task_name}/{args.task_name}_{args.data_num}/without_layerskip_draft_model_answer/{args.model_id}/{args.model_name}.jsonl"
     set_logger()
 
     print(f"Output to {answer_file}")
@@ -328,8 +400,10 @@ if __name__ == "__main__":
                                                                                   task_name=args.task_name)
     else:
         # Unified layer set initialization
-        _attn_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)  # keep the first and last layer
-        _mlp_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)
+        # _attn_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)  # keep the first and last layer
+        # _mlp_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)
+        _attn_skip_layer_id_set = []  
+        _mlp_skip_layer_id_set = []
 
     model.set_skip_layers(_attn_skip_layer_id_set, _mlp_skip_layer_id_set)
 
@@ -346,10 +420,11 @@ if __name__ == "__main__":
                   "context_window": args.context_window, "optimization": args.optimization, "bayes": args.bayes,
                   "draft_kv_compress": args.draft_kv_compress, "draft_kv_retain_ratio": args.draft_kv_retain_ratio}
 
+    forward_f = draft_only_forward if args.draft_only else swift_forward
     run_eval(
         model=model,
         tokenizer=tokenizer,
-        forward_func=swift_forward,
+        forward_func=forward_f,
         model_id=args.model_id,
         answer_file=answer_file,
         max_new_tokens=args.max_new_tokens,
