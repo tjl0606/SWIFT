@@ -6,6 +6,7 @@ import logging
 import torch
 import numpy as np
 from .kv_cache import clone_past_key_values
+
 TOPK = 10  # topk for sparse tree
 
 from transformers.generation.logits_process import (
@@ -18,30 +19,31 @@ from transformers.generation.logits_process import (
 
 
 def set_logger(log_path=None):
-    """Set the logger to log info in terminal and file `log_path`.
-    In general, it is useful to have a logger so that every output to the terminal is saved
-    in a permanent file. Here we save it to `model_dir/train.log`.
-    Example:
-    ```
-    logging.info("Starting training...")
-    ```
-    Args:
-        log_path: (string) where to log
-    """
+    """Set the logger to log info in terminal and file `log_path`."""
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
     if not logger.handlers:
-        # Logging to a file
         if log_path:
             file_handler = logging.FileHandler(log_path)
             file_handler.setFormatter(logging.Formatter('%(asctime)s:%(levelname)s: %(message)s'))
             logger.addHandler(file_handler)
 
-        # Logging to console
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(logging.Formatter('%(message)s'))
         logger.addHandler(stream_handler)
+
+
+def _clear_swift_tree_state(model):
+    """
+    Clear tree-specific runtime state before entering a normal verify / draft /
+    cache-rebuild path.
+
+    This is the key fix for stale swift_mask causing shape mismatches like:
+    old swift_len != rebuilt KV cache length.
+    """
+    if hasattr(model, "model") and hasattr(model.model, "swift_mask"):
+        model.model.swift_mask = None
 
 
 def get_cache_configuration(file_name='skip_layers.json', model_name='llama-2-13b', task_name='cnndm'):
@@ -60,16 +62,10 @@ def get_cache_configuration(file_name='skip_layers.json', model_name='llama-2-13
             print(f"Use cached configuration in {file_name}.")
             return data[f'{model_name}_{task_name}']['attention'], data[f'{model_name}_{task_name}']['mlp']
 
+
 def get_choices_list(prob_list, logits_processor=None):
     """
     Generate tree choices list based on the provided confidence.
-
-    Parameters:
-    - prob_list (list): List of probabilities.
-    - logits_processor (LogitsProcessorList): Processor to use for sampling.
-
-    Returns:
-    - list: A nested list containing choices based on the probabilities.
     """
     choices_list = []
     if logits_processor is not None:
@@ -85,8 +81,9 @@ def get_choices_list(prob_list, logits_processor=None):
             candidate_num = candidate_set[2]
         else:
             candidate_num = candidate_set[3]
-        choices_list.extend([[0]*idx + [i] for i in range(candidate_num)])
+        choices_list.extend([[0] * idx + [i] for i in range(candidate_num)])
     return choices_list
+
 
 def prepare_logits_processor(
         temperature: float = 0.0,
@@ -96,15 +93,6 @@ def prepare_logits_processor(
 ) -> LogitsProcessorList:
     """
     Prepare the logits processor based on the provided parameters.
-
-    Parameters:
-    - temperature (float): Softmax temperature for probability scaling.
-    - repetition_penalty (float): Penalty for repeating tokens.
-    - top_p (float): Nucleus sampling probability threshold.
-    - top_k (int): Top-k sampling threshold.
-
-    Returns:
-    - LogitsProcessorList: A list of processors to apply to the logits.
     """
     processor_list = LogitsProcessorList()
     if temperature > 1e-5:
@@ -122,47 +110,17 @@ def prepare_logits_processor(
 def pad_path(path, length, pad_value=-2):
     """
     Pad the given path list with a specific value up to a specified length.
-
-    Parameters:
-    - path (list): The original list that needs padding.
-    - length (int): The desired length of the padded list.
-    - pad_value (optional, default=-2): The value to use for padding.
-
-    Returns:
-    - list: A new list based on the original path but padded to the desired length.
-
-    Example:
-    >>> pad_path([1,2,3], 5)
-    [1, 2, 3, -2, -2]
-
-    Note:
-    If the given path is already longer than the specified length,
-    then no padding occurs, and the original path is returned.
     """
-
-    # Calculate the number of padding values needed by subtracting the length
-    # of the path from the desired length.
-    # Append the padding values to the original path and return the new list.
     return path + [pad_value] * (length - len(path))
 
 
 def generate_swift_buffers(swift_choices, device="cuda"):
     """
     Generate buffers for the swift structure based on the provided choices.
-
-    Parameters:
-    - swift_choices (list): A nested list representing tree in the swift structure.
-    - device (str): Device to which the tensors should be moved. Default is "cuda".
-
-    Returns:
-    - dict: A dictionary containing buffers related to the swift structure.
     """
-
-    # Sort the swift_choices based on their lengths and then their values
     sorted_swift_choices = sorted(swift_choices, key=lambda x: (len(x), x))
     swift_len = len(sorted_swift_choices) + 1
 
-    # Initialize depth_counts to keep track of how many choices have a particular depth
     depth_counts = []
     prev_depth = 0
     for path in sorted_swift_choices:
@@ -172,14 +130,12 @@ def generate_swift_buffers(swift_choices, device="cuda"):
         depth_counts[depth - 1] += 1
         prev_depth = depth
 
-    # Create the attention mask for swift
     swift_attn_mask = torch.eye(swift_len, swift_len)
     swift_attn_mask[:, 0] = 1
     start = 0
     for i in range(len(depth_counts)):
         for j in range(depth_counts[i]):
             cur_swift_choice = sorted_swift_choices[start + j]
-            # retrieve ancestor position
             if len(cur_swift_choice) == 1:
                 continue
             ancestor_idx = []
@@ -188,7 +144,6 @@ def generate_swift_buffers(swift_choices, device="cuda"):
             swift_attn_mask[j + start + 1, ancestor_idx] = 1
         start += depth_counts[i]
 
-    # Generate tree indices for the swift structure
     swift_tree_indices = torch.zeros(swift_len, dtype=torch.long)
     swift_p_indices = [0 for _ in range(swift_len - 1)]
     swift_b_indices = [[] for _ in range(swift_len - 1)]
@@ -207,7 +162,6 @@ def generate_swift_buffers(swift_choices, device="cuda"):
             b.append(cur_swift_choice[-1] + TOPK * i + 1)
         start += depth_counts[i]
 
-    # Generate position IDs for the swift structure
     swift_p_indices = [-1] + swift_p_indices
     swift_position_ids = torch.zeros(swift_len, dtype=torch.long)
     start = 0
@@ -215,7 +169,6 @@ def generate_swift_buffers(swift_choices, device="cuda"):
         swift_position_ids[start + 1: start + depth_counts[i] + 1] = i + 1
         start += depth_counts[i]
 
-    # Generate retrieval indices for swift structure verification
     retrieve_indices_nest = []
     retrieve_paths = []
     for i in range(len(sorted_swift_choices)):
@@ -232,13 +185,14 @@ def generate_swift_buffers(swift_choices, device="cuda"):
     retrieve_indices = [pad_path(path, max_length) for path in retrieve_indices_nest]
     retrieve_indices = torch.tensor(retrieve_indices, dtype=torch.long)
     retrieve_indices = retrieve_indices + 1
-    retrieve_indices = torch.cat([torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long), retrieve_indices],
-                                 dim=1)
+    retrieve_indices = torch.cat(
+        [torch.zeros((retrieve_indices.shape[0], 1), dtype=torch.long), retrieve_indices],
+        dim=1
+    )
 
     maxitem = retrieve_indices.max().item() + 5
 
     def custom_sort(lst):
-        # sort_keys=[len(list)]
         sort_keys = []
         for i in range(len(lst)):
             sort_keys.append(lst[i] if lst[i] >= 0 else maxitem)
@@ -271,7 +225,6 @@ def generate_swift_buffers(swift_choices, device="cuda"):
                     iblist.append(b)
         swift_b_indices_new.append(iblist)
 
-    # Aggregate the generated buffers into a dictionary
     swift_buffers = {
         "swift_attn_mask": swift_attn_mask.unsqueeze(0).unsqueeze(0),
         "tree_indices": swift_tree_indices,
@@ -279,7 +232,6 @@ def generate_swift_buffers(swift_choices, device="cuda"):
         "retrieve_indices": retrieve_indices,
     }
 
-    # Move the tensors in the dictionary to the specified device
     swift_buffers = {
         k: v.clone().to(device)
         if isinstance(v, torch.Tensor)
@@ -294,28 +246,13 @@ def generate_swift_buffers(swift_choices, device="cuda"):
 def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key_values_data, current_length_data, logits_processor=None):
     """
     Initializes the swift structure for a given model.
-
-    This function performs the following operations:
-    1. Forward pass through the model to obtain the full model logits and swift drafting logits.
-
-    Args:
-    - input_ids (torch.Tensor): The input tensor containing token ids.
-    - model (LLM): The model containing the full LLM model.
-    - max_new_tokens (int): Maximum number of tokens to generate.
-    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values.
-    - past_key_values_data (torch.Tensor): Tensor containing past hidden states for the transformer model.
-    - current_length_data (torch.Tensor): Tensor containing the current length of sequences in the batch.
-    - logits_processor (LogitsProcessorList): Processor to use for sampling.
-
-    Returns:
-    - swift_logits (torch.Tensor): Logits associated with the swift structure.
-    - sample_token (torch.Tensor): Token sampled from probability distribution.
-    - top1_prob (float): Probability of the sampled token.
     """
     with torch.inference_mode():
-        # Pass input through the base model
+        # Normal verify path: must not reuse a stale tree mask
+        _clear_swift_tree_state(model)
+
         outputs, logits = swift_verify(model, input_ids, past_key_values=past_key_values)
-        # Obtain the logits from the full model
+
         if logits_processor is not None:
             last_logits = logits[:, -1]
             last_logits = logits_processor(None, last_logits)
@@ -324,7 +261,7 @@ def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key
         else:
             sample_token = torch.argmax(logits[:, -1])
             sample_token = sample_token[None, None]
-        # Pass input through the swift structure (sub-layer set)
+
         swift_logits, top1_prob = swift_draft(
             model,
             input_ids=sample_token,
@@ -345,19 +282,8 @@ def swift_verify(
 ):
     """
     Verify the swift structure using the provided model and input.
-
-    Args:
-    - input_ids (torch.Tensor): The input tensor containing token ids.
-    - model (LLM): The model containing the full LLM model.
-    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values.
-    - position_ids (torch.Tensor): Positional IDs associated with the swift structure.
-
-    Returns:
-    - outputs (tuple): Contains the outputs from the model.
-    - orig (torch.Tensor): Original logits from the full model.
     """
     with torch.inference_mode():
-        # Pass input through the base model
         outputs = model.model(
             input_ids=input_ids,
             attention_mask=None,
@@ -372,18 +298,8 @@ def swift_verify(
 def sample(logits, logits_processor, k=1):
     """
     Sample from the provided logits using the specified processor.
-
-    Args:
-    - logits (torch.Tensor): Logits to sample from.
-    - logits_processor (LogitsProcessorList): Processor to use for sampling.
-    - k (int): Number of samples to generate.
-
-    Returns:
-    - sampled_indices (torch.Tensor): Indices of the sampled tokens.
-    - sampled_probs (torch.Tensor): Probabilities of the sampled tokens.
-    - probabilities (torch.Tensor): Probabilities of all tokens.
     """
-    logits = logits.view(-1, logits.size(-1)) # default batch size 1
+    logits = logits.view(-1, logits.size(-1))
     logits = logits_processor(None, logits)
     probabilities = torch.nn.functional.softmax(logits, dim=-1)
 
@@ -392,7 +308,9 @@ def sample(logits, logits_processor, k=1):
 
     cumulative_sum = torch.cumsum(sampled_probs, dim=-1)
     cumulative_sum = torch.cat(
-        (torch.zeros(cumulative_sum.shape[0], 1, device=cumulative_sum.device), cumulative_sum[:, :-1]), dim=-1)
+        (torch.zeros(cumulative_sum.shape[0], 1, device=cumulative_sum.device), cumulative_sum[:, :-1]),
+        dim=-1
+    )
 
     sampled_probs = sampled_probs / (1 - cumulative_sum)
     sampled_probs[torch.isinf(sampled_probs)] = -1
@@ -419,23 +337,10 @@ def swift_draft(
 ):
     """
     Draft new tokens using the swift structure.
-
-    Args:
-    - model (LLM): The model containing the full LLM model.
-    - input_ids (torch.Tensor): The input tensor containing token ids.
-    - new_token_num (int): Counter for the new tokens added during inference.
-    - past_key_values_data (torch.Tensor): Tensor containing past hidden states for the transformer model.
-    - current_length_data (torch.Tensor): Tensor containing the current length of sequences in the batch.
-    - max_new_tokens (int): Maximum number of tokens to generate.
-    - position_ids (torch.Tensor): Positional IDs associated with the swift structure.
-    - max_step_draft (int): Maximum number of draft steps to take.
-    - logits_processor (LogitsProcessorList): Processor to use for sampling.
-    - stop_threshold (float): Threshold for stopping the draft process.
-
-    Returns:
-    - draft_logits (torch.Tensor): Logits associated with the draft steps.
-    - top1_prob (float): Probability of the sampled token.
     """
+    # Normal draft path must not reuse a stale tree mask from the previous tree decoding round
+    _clear_swift_tree_state(model)
+
     if hasattr(model, "draft_kv_compress") and model.draft_kv_compress and model.draft_kv_retain_ratio < 0.9999:
         draft_past_key_values_data, draft_current_length_data, draft_past_key_values = rebuild_compressed_draft_cache(
             model=model,
@@ -455,6 +360,9 @@ def swift_draft(
             model, draft_past_key_values_data, draft_current_length_data
         )
 
+    # Be explicit again after rebuilding / cloning cache
+    _clear_swift_tree_state(model)
+
     ss_token, ss_prob, ss_op, top1_prob = [], [], [], []
     with torch.inference_mode():
         for step_draft in range(max_step_draft):
@@ -466,6 +374,7 @@ def swift_draft(
                     position_ids=position_ids,
                 )
             current_draft_logits = model.lm_head(draft_outputs[0])
+
             if logits_processor is not None:
                 topk_index, topk_prob, op = sample(current_draft_logits, logits_processor, k=TOPK)
                 input_ids = topk_index[:, 0].unsqueeze(0)
@@ -474,89 +383,28 @@ def swift_draft(
                 topk_index, topk_prob = top.indices, top.values
                 input_ids = topk_index[:, :, 0]
                 op = None
+
             ss_token.append(topk_index)
             ss_prob.append(topk_prob)
             ss_op.append(op)
+
             origin_draft_probs = current_draft_logits.softmax(-1)
             argmax_prob = torch.gather(origin_draft_probs, -1, input_ids.unsqueeze(-1)).squeeze(-1)
             current_threshold = argmax_prob.item()
             top1_prob.append(current_threshold)
+
             if current_threshold < stop_threshold or new_token_num + step_draft + 2 >= max_new_tokens:
                 break
+
     return (torch.cat(ss_token), torch.cat(ss_prob), ss_op), top1_prob
 
 
-def reset_swift_mode(
-        model,
-):
+def reset_swift_mode(model):
     """
     Resets the swift settings to their initial state.
-
-    This function ensures that after any operations involving swift,
-    the model's the swift attention mask return to their default state.
     """
-    model.model.swift_mask = None
+    _clear_swift_tree_state(model)
 
-# def compress_draft_past_key_values_recent(
-#         past_key_values_data_list,
-#         current_length_data,
-#         retain_ratio=1.0,
-#         min_retain_tokens=16,
-# ):
-#     """
-#     Compress draft KV cache by keeping only the most recent tokens.
-#     This function modifies the cloned draft KV cache in-place.
-
-#     Args:
-#         past_key_values_data_list (list[torch.Tensor]):
-#             Each tensor has shape [2 * num_layers_on_device, batch, num_kv_heads, max_pos, head_dim]
-#         current_length_data (torch.Tensor):
-#             CPU tensor of shape [num_hidden_layers * 2]
-#         retain_ratio (float):
-#             Fraction of tokens to keep. 1.0 means no compression.
-#         min_retain_tokens (int):
-#             Minimum number of past tokens to retain.
-#     """
-#     if retain_ratio >= 0.9999:
-#         return
-
-#     num_entries = current_length_data.size(0)
-
-#     for kv_idx in range(num_entries):
-#         cur_len = current_length_data[kv_idx].item()
-
-#         if cur_len <= min_retain_tokens:
-#             continue
-
-#         keep_len = max(min_retain_tokens, int(cur_len * retain_ratio))
-#         keep_len = min(keep_len, cur_len)
-
-#         if keep_len == cur_len:
-#             continue
-
-#         start_idx = cur_len - keep_len
-
-#         # Figure out which tensor block and which local slot correspond to kv_idx
-#         # We scan through the per-device packed tensors in order.
-#         running = 0
-#         target_tensor = None
-#         local_idx = None
-#         for data in past_key_values_data_list:
-#             block_size = data.shape[0]  # number of packed k/v entries in this block
-#             if kv_idx < running + block_size:
-#                 target_tensor = data
-#                 local_idx = kv_idx - running
-#                 break
-#             running += block_size
-
-#         if target_tensor is None:
-#             raise RuntimeError(f"Cannot locate KV entry {kv_idx} in draft cache.")
-
-#         # target_tensor[local_idx] shape: [batch, num_kv_heads, max_pos, head_dim]
-#         # Keep only the most recent keep_len tokens by moving them to the front.
-#         src = target_tensor[local_idx, :, :, start_idx:cur_len, :].clone()
-#         target_tensor[local_idx, :, :, :keep_len, :].copy_(src)
-#         current_length_data[kv_idx].fill_(keep_len)
 
 def rebuild_compressed_draft_cache(
         model,
@@ -568,23 +416,11 @@ def rebuild_compressed_draft_cache(
 ):
     """
     Rebuild a draft cache using only the most recent contiguous suffix tokens.
-
-    Args:
-        model: SWIFT model
-        full_input_ids: current full sequence, shape [1, seq_len]
-        past_key_values_data: original full cache tensors
-        current_length_data: original current lengths
-        retain_ratio: fraction of tokens to retain
-        min_retain_tokens: minimum number of retained tokens
-
-    Returns:
-        draft_past_key_values_data, draft_current_length_data, draft_past_key_values
     """
     full_len = full_input_ids.shape[1]
     keep_len = max(min_retain_tokens, int(full_len * retain_ratio))
     keep_len = min(keep_len, full_len)
 
-    # ratio = 1.0 時保留全部，應該與原始 SWIFT 對齊
     if keep_len == full_len:
         draft_past_key_values_data = []
         for i in range(len(past_key_values_data)):
@@ -595,13 +431,6 @@ def rebuild_compressed_draft_cache(
         )
         return draft_past_key_values_data, draft_current_length_data, draft_past_key_values
 
-    # only recent contiguous suffix
-    # kept_input_ids = full_input_ids[:, -keep_len:]
-
-    # [FIX] Keep the first few "sink" tokens (e.g., BOS token and start of prompt)
-    # LLaMA models rely heavily on the initial tokens as attention sinks. 
-    # Dropping them causes catastrophic attention collapse, severely degrading logits 
-    # and acceptance rate even with just 1% compression.
     sink_len = 4
     if keep_len > sink_len and full_len > keep_len:
         kept_input_ids = torch.cat([
@@ -611,7 +440,6 @@ def rebuild_compressed_draft_cache(
     else:
         kept_input_ids = full_input_ids[:, -keep_len:]
 
-    # 建一份新的 draft cache
     draft_past_key_values_data = []
     for i in range(len(past_key_values_data)):
         x = past_key_values_data[i].clone()
@@ -625,7 +453,11 @@ def rebuild_compressed_draft_cache(
         model, draft_past_key_values_data, draft_current_length_data
     )
 
-    # 用保留下來的 recent suffix 重新 prefill draft cache
+    # Critical fix:
+    # cache rebuild is a normal verify/prefill pass, not tree decoding.
+    # Do not reuse the previous round's swift_mask.
+    _clear_swift_tree_state(model)
+
     with torch.inference_mode():
         swift_verify(
             model,
@@ -635,19 +467,10 @@ def rebuild_compressed_draft_cache(
 
     return draft_past_key_values_data, draft_current_length_data, draft_past_key_values
 
+
 def reset_past_key_values(past_key_values):
     """
     Resets the current lengths in the past key-values to zero.
-
-    This function is designed to be used during the evaluation of a baseline model.
-    It iterates through each layer's key-values and sets their current lengths to zero,
-    effectively resetting their state.
-
-    Args:
-    - past_key_values (list of torch.Tensor): Contains past hidden states and past attention values for each layer.
-
-    Returns:
-    - past_key_values (list of torch.Tensor): Updated past hidden states and past attention values with reset lengths.
     """
     for i in range(len(past_key_values)):
         for j in range(2):
@@ -658,51 +481,38 @@ def reset_past_key_values(past_key_values):
 def generate_candidates(swift_logits, tree_indices, retrieve_indices, sample_token, logits_processor):
     """
     Generate candidates based on provided logits and indices.
-
-    Parameters:
-    - swift_logits (torch.Tensor): Logits associated with the swift structure.
-    - tree_indices (list or torch.Tensor): Indices associated with a tree structure.
-    - retrieve_indices (list or torch.Tensor): Indices for retrieving candidates.
-    - sample_token (torch.Tensor): Token sampled from probability distribution.
-    - logits_processor (LogitsProcessorList): Processor to use for sampling.
-
-    Returns:
-    - tuple: Returns cartesian candidates and tree candidates.
     """
     sample_token = sample_token.to(tree_indices.device)
 
-    # Greedy decoding: Select the most probable candidate from the original logits.
     candidates_logit = sample_token[0]
-
-    # Extract the TOPK candidates from the swift logits.
     candidates_swift_logits = swift_logits[0]
 
-    # Combine the selected candidate from the original logits with the topk swift logits.
     candidates = torch.cat([candidates_logit, candidates_swift_logits.view(-1)], dim=-1)
-
-    # Map the combined candidates to the tree indices to get tree candidates.
     tree_candidates = candidates[tree_indices]
 
-    # Extend the tree candidates by appending a zero.
-    tree_candidates_ext = torch.cat([tree_candidates, torch.zeros((1), dtype=torch.long, device=tree_candidates.device)], dim=0)
+    tree_candidates_ext = torch.cat(
+        [tree_candidates, torch.zeros((1), dtype=torch.long, device=tree_candidates.device)],
+        dim=0
+    )
 
-    # Retrieve the cartesian candidates using the retrieve indices.
     cart_candidates = tree_candidates_ext[retrieve_indices]
 
     if logits_processor is not None:
         candidates_tree_prob = swift_logits[1]
         candidates_prob = torch.cat(
             [torch.ones(1, device=candidates_tree_prob.device, dtype=torch.float32), candidates_tree_prob.view(-1)],
-            dim=-1)
+            dim=-1
+        )
 
         tree_candidates_prob = candidates_prob[tree_indices]
         tree_candidates_prob_ext = torch.cat(
-            [tree_candidates_prob, torch.ones((1), dtype=torch.float32, device=tree_candidates_prob.device)], dim=0)
+            [tree_candidates_prob, torch.ones((1), dtype=torch.float32, device=tree_candidates_prob.device)],
+            dim=0
+        )
         cart_candidates_prob = tree_candidates_prob_ext[retrieve_indices]
     else:
         cart_candidates_prob = None
 
-    # Unsqueeze the tree candidates for dimension consistency.
     tree_candidates = tree_candidates.unsqueeze(0)
     return cart_candidates, cart_candidates_prob, tree_candidates
 
@@ -717,23 +527,9 @@ def tree_decoding(
 ):
     """
     Decode the tree candidates using the provided model and reorganize the logits.
-
-    Parameters:
-    - model (nn.Module): Model to be used for decoding the tree candidates.
-    - tree_candidates (torch.Tensor): Input candidates based on a tree structure.
-    - past_key_values (torch.Tensor): Past states, such as key and value pairs, used in attention layers.
-    - swift_position_ids (torch.Tensor): Positional IDs associated with the swift structure.
-    - input_ids (torch.Tensor): Input sequence IDs.
-    - retrieve_indices (list or torch.Tensor): Indices for reordering the logits.
-
-    Returns:
-    - tuple: Returns swift logits, regular logits, and other outputs from the model.
     """
-
-    # Compute new position IDs by adding the swift position IDs to the length of the input sequence.
     position_ids = swift_position_ids + input_ids.shape[1]
 
-    # Use the model to decode the tree candidates.
     outputs, tree_logits = swift_verify(
         model,
         tree_candidates,
@@ -741,7 +537,6 @@ def tree_decoding(
         position_ids=position_ids,
     )
 
-    # Reorder the obtained logits and hidden states based on the retrieve_indices to ensure consistency with some reference ordering.
     logits = tree_logits[0, retrieve_indices]
 
     return logits, outputs
@@ -758,36 +553,17 @@ def evaluate_posterior(
         b_indices
 ):
     """
-    Evaluate the posterior probabilities of the candidates based on the provided logits and choose the best candidate.
-
-    Depending on the temperature value, the function either uses greedy decoding or evaluates posterior
-    probabilities to select the best candidate.
-
-    Args:
-    - logits (torch.Tensor): Predicted logits of shape (batch_size, sequence_length, vocab_size).
-    - candidates (torch.Tensor): Candidate token sequences.
-    - logits_processor (LogitsProcessorList): Processor to use for sampling.
-    - cart_candidates_prob (torch.Tensor): Cartesian candidates probabilities.
-    - op (list): List of output probabilities.
-    - p_indices (list): List of parent indices.
-    - tree_candidates (torch.Tensor): Tree candidates.
-    - b_indices (list): List of branch indices.
-
-    Returns:
-    - best_candidate (torch.Tensor): Index of the chosen best candidate.
-    - accept_length (int): Length of the accepted candidate sequence.
+    Evaluate the posterior probabilities of the candidates based on the provided logits
+    and choose the best candidate.
     """
-    # Greedy decoding based on temperature value
     if logits_processor is None:
-        # Find the tokens that match the maximum logits for each position in the sequence
         posterior_mask = (
                 candidates[:, 1:].to(logits.device) == torch.argmax(logits[:, :-1], dim=-1)
         ).int()
         candidates_accept_length = (torch.cumprod(posterior_mask, dim=1)).sum(dim=1)
         accept_length = candidates_accept_length.max()
-        # Choose the best candidate
+
         if accept_length == 0:
-            # Default to the first candidate if none are accepted
             best_candidate = torch.tensor(0, dtype=torch.long, device=candidates.device)
         else:
             best_candidate = torch.argmax(candidates_accept_length).to(torch.long)
@@ -799,6 +575,7 @@ def evaluate_posterior(
         best_candidate = 0
         adjustflag = False
         gtp = None
+
         for i in range(1, candidates.shape[1]):
             if i != accept_length:
                 break
@@ -809,6 +586,7 @@ def evaluate_posterior(
             gt_logits = logits_processor(None, gt_logits)[0]
             gtp = torch.softmax(gt_logits, dim=0)
             candidates_set = []
+
             for j in range(candidates.shape[0]):
                 if is_eq[j]:
                     x = candidates[j, i]
@@ -837,32 +615,27 @@ def evaluate_posterior(
                         max_id = gtp.argmax()
                         gtp = gtp - q
                         gtp[gtp < 0] = 0
-                        if torch.equal(gtp.cpu(), torch.zeros(gtp.shape)): # multinomial error
+                        if torch.equal(gtp.cpu(), torch.zeros(gtp.shape)):
                             gtp[max_id] = 1
                         gtp = gtp / (gtp.sum() + 1e-6)
                         adjustflag = True
+
         if adjustflag and accept_length != candidates.shape[1]:
             sample_p = gtp
         else:
             gt_logits = logits[best_candidate, accept_length - 1]
             sample_p = torch.softmax(gt_logits, dim=0)
+
         return best_candidate, accept_length - 1, sample_p
 
 
 def get_next_point_to_probe(attn_skip_layers, mlp_skip_layers, num_hidden_layers=40):
     """
     Get the next point to probe of Bayes Optimization based on the skip layers.
-    Args:
-    - skip_attn_layers (list): List of indices of the skipped attention layers.
-    - skip_mlp_layers (list): List of indices of the skipped MLP layers.
-    - num_hidden_layers (int): Number of hidden layers in the model.
-
-    Returns:
-    - dict: A dictionary containing the next point to probe.
     """
     next_point_to_probe = {}
     for i in range(num_hidden_layers - 2):
-        if (i+1) in attn_skip_layers:
+        if (i + 1) in attn_skip_layers:
             next_point_to_probe[f"x{i}"] = 1.0
         else:
             next_point_to_probe[f"x{i}"] = 0.0
@@ -878,23 +651,14 @@ def get_next_point_to_probe(attn_skip_layers, mlp_skip_layers, num_hidden_layers
 
 def layer_bayes_search(optimizer, utility, num_skip_layers=34, num_hidden_layers=40):
     """
-    Perform Bayesian optimization to select the next point to probe based on the utility function.
-    Args:
-    - optimizer (BayesianOptimization): The optimizer used for Bayesian optimization.
-    - utility (function): The utility function used for Bayesian optimization.
-    - num_skip_layers (int): Number of layers to skip.
-    - num_hidden_layers (int): Number of hidden layers in the model.
-
-    Returns:
-    - dict: A dictionary containing the next point to probe.
-    - list: List of indices of the skipped attention layers.
-    - list: List of indices of the skipped MLP layers.
+    Perform Bayesian optimization to select the next point to probe.
     """
     next_point_to_probe = optimizer.suggest(utility)
     sorted_point = sorted(next_point_to_probe.items(), reverse=True, key=lambda item: item[1])
     skip_layer_list = [k for (k, v) in sorted_point[:num_skip_layers]]
     attn_skip_layers = []
     mlp_skip_layers = []
+
     for i in range(num_hidden_layers - 2):
         if f"x{i}" in skip_layer_list:
             attn_skip_layers.append(i + 1)
@@ -907,24 +671,19 @@ def layer_bayes_search(optimizer, utility, num_skip_layers=34, num_hidden_layers
 
 def layer_random_search(num_skip_layers=34, num_hidden_layers=40):
     """
-    Randomly select layers for skipping, always keep the first and last layer
-    Args:
-    - num_skip_layers (int): Number of layers to skip.
-    - num_hidden_layers (int): Number of hidden layers in the model.
-
-    Returns:
-    - list: List of indices of the skipped attention layers.
-    - list: List of indices of the skipped MLP layers.
+    Randomly select layers for skipping, always keep the first and last layer.
     """
-    skip_layer_list = np.random.choice((num_hidden_layers-2) * 2, num_skip_layers, replace=False)
+    skip_layer_list = np.random.choice((num_hidden_layers - 2) * 2, num_skip_layers, replace=False)
     attn_skip_layers = []
     mlp_skip_layers = []
+
     for i in range(num_hidden_layers - 2):
         if i in skip_layer_list:
             attn_skip_layers.append(i + 1)
     for i in range(num_hidden_layers - 2, (num_hidden_layers - 2) * 2):
         if i in skip_layer_list:
             mlp_skip_layers.append(i - (num_hidden_layers - 2) + 1)
+
     return attn_skip_layers, mlp_skip_layers
 
 
@@ -932,19 +691,7 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
             input_current_length_data, new_token_num, statistics, optimizer=None, utility=None, position_ids=None):
     """
     Perform an optimization to find the optimal layer set for the model based on the draft matchness.
-
-    Args:
-    - model (LLM): The model containing the full LLM model.
-    - output_ids (torch.Tensor): The output token sequences.
-    - input_past_key_values_data (torch.Tensor): Tensor containing past hidden states for the transformer model.
-    - input_current_length_data (torch.Tensor): Tensor containing the current length of sequences in the batch.
-    - new_token_num (int): Counter for the new tokens added during inference.
-    - statistics (dict): Dictionary containing the optimization statistics.
-    - optimizer (BayesianOptimization): The optimizer used for Bayesian optimization.
-    - utility (function): The utility function used for Bayesian optimization.
-    - position_ids (torch.Tensor): Positional IDs associated with the swift structure.
     """
-    # Avoid modifying the input_ids in-place
     generate_ids = output_ids.clone()
 
     cur_past_key_values_data = []
@@ -963,12 +710,9 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
     else:
         input_past_key_values = clone_past_key_values(model, cur_past_key_values_data, cur_current_length_data)
 
-    # preserve original layer set
     origin_attn_skip_layer_id_set, origin_mlp_skip_layer_id_set = model.get_skip_layers()
-
     skip_layer_num = int((model.config.num_hidden_layers - 2) * 2 * statistics["skip_ratio"])
 
-    # select new layer set
     if (statistics["opt_iter"] + 1) % statistics["bayes_interval"] == 0 and statistics["bayes"]:
         logging.info("*" * 30 + "Bayes Search!" + "*" * 30)
         next_point_to_probe, _attn_skip_layer_id_set, _mlp_skip_layer_id_set = layer_bayes_search(
@@ -976,43 +720,56 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
     else:
         _attn_skip_layer_id_set, _mlp_skip_layer_id_set = layer_random_search(
             num_skip_layers=skip_layer_num, num_hidden_layers=model.config.num_hidden_layers)
-        next_point_to_probe = get_next_point_to_probe(_attn_skip_layer_id_set, _mlp_skip_layer_id_set, model.config.num_hidden_layers)
+        next_point_to_probe = get_next_point_to_probe(
+            _attn_skip_layer_id_set, _mlp_skip_layer_id_set, model.config.num_hidden_layers
+        )
+
     model.set_skip_layers(_attn_skip_layer_id_set, _mlp_skip_layer_id_set)
 
-    # parallel drafting on previous decoded results
+    # Optimization path is also a normal draft forward, not tree decoding
+    _clear_swift_tree_state(model)
+
     with torch.inference_mode():
         with model.self_draft():
             step_end = statistics["context_window"] + 1
-            parallel_draft_output = model.model(input_ids=generate_ids[:, :step_end],
-                                                attention_mask=None,
-                                                past_key_values=input_past_key_values,
-                                                position_ids=position_ids)
+            parallel_draft_output = model.model(
+                input_ids=generate_ids[:, :step_end],
+                attention_mask=None,
+                past_key_values=input_past_key_values,
+                position_ids=position_ids
+            )
+
     parallel_draft_logits = model.lm_head(parallel_draft_output[0])
     parallel_draft_output_ids = torch.argmax(parallel_draft_logits, dim=-1)
-    verified_token_num = (parallel_draft_output_ids[:, :-1] == generate_ids[:, 1:step_end].to(parallel_draft_output_ids.device)).sum(-1).item()
+    verified_token_num = (
+        parallel_draft_output_ids[:, :-1] == generate_ids[:, 1:step_end].to(parallel_draft_output_ids.device)
+    ).sum(-1).item()
     drafted_token_num = generate_ids[:, 1:step_end].size(-1)
     score = verified_token_num / drafted_token_num
     logging.info('opt_iter {}, matchness {:.4f}'.format(statistics["opt_iter"], score))
 
-    # update the bayes optimizer
     optimizer.register(params=next_point_to_probe, target=score)
 
     if score > statistics["origin_score"]:
-        logging.info("=" * 30 + 'matchness changed from {:.4f} to {:.4f}'.format(statistics["origin_score"], score) + "=" * 30)
+        logging.info("=" * 30 + 'matchness changed from {:.4f} to {:.4f}'.format(
+            statistics["origin_score"], score
+        ) + "=" * 30)
         statistics["origin_score"] = score
         statistics["tolerance_iter"] = 0
         if score > statistics["max_score"]:
-            statistics["optimization"] = False  # stop optimization
+            statistics["optimization"] = False
             logging.info("=" * 30 + 'Optimization Stopped because the score reaches the expected number!' + "=" * 30)
     else:
-        model.set_skip_layers(origin_attn_skip_layer_id_set, origin_mlp_skip_layer_id_set)  # choose the better one
+        model.set_skip_layers(origin_attn_skip_layer_id_set, origin_mlp_skip_layer_id_set)
         statistics["tolerance_iter"] += 1
+
     statistics["opt_iter"] += 1
+
     if statistics["tolerance_iter"] > statistics["max_tolerance_iter"]:
-        statistics["optimization"] = False  # stop optimization
+        statistics["optimization"] = False
         logging.info("=" * 30 + 'Optimization Stopped because the optimization iter reaches the max tolerance!' + "=" * 30)
     if statistics["opt_iter"] > statistics["max_opt_iter"]:
-        statistics["optimization"] = False  # stop optimization
+        statistics["optimization"] = False
         logging.info("=" * 30 + 'Optimization Stopped because the optimization iter reaches the maximum!' + "=" * 30)
 
 
@@ -1029,45 +786,22 @@ def update_inference_inputs(
         sample_p,
 ):
     """
-    Update the input sequences and relevant tensors based on the selected best candidate from the inference results.
-
-    Args:
-    - input_ids (torch.Tensor): Current input token sequences.
-    - candidates (torch.Tensor): Candidate token sequences generated in the current step.
-    - best_candidate (int): Index of the chosen best candidate.
-    - accept_length (int): Length of the accepted candidate sequence.
-    - retrieve_indices (torch.Tensor): Indices to map tree to a cartesian product.
-    - logits (torch.Tensor): Model's outputs from the previous inference step.
-    - new_token_num (int): Counter for the new tokens added during inference.
-    - past_key_values_data (torch.Tensor): Tensor containing past hidden states for the transformer model.
-    - current_length_data (torch.Tensor): Tensor containing the current length of sequences in the batch.
-    - sample_p (torch.Tensor): Probability of the sampled token.
-
-    Returns:
-    - input_ids (torch.Tensor): Updated input token sequences.
-    - new_token_num (int): Updated counter for the new tokens added.
-    - sample_token (torch.Tensor): Token sampled from probability distribution.
+    Update the input sequences and relevant tensors based on the selected best candidate.
     """
-    # Calculate the starting position for new tokens based on the previous input length
     prev_input_len = input_ids.shape[1]
-    # Map the best candidate indices to the original indices in the sequence
     select_indices = (
             retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
     )
-    # Append the tokens from the best candidate to the input sequence
+
     input_ids = torch.cat(
         [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
     )
-    # Update the past key values based on the selected tokens
-    # Source tensor that contains relevant past information based on the selected candidate
+
     for past_key_values_data in past_key_values_data_list:
         tgt = past_key_values_data[..., select_indices.to(past_key_values_data.device), :]
-        # Destination tensor where the relevant past information will be stored
         dst = past_key_values_data[..., prev_input_len: prev_input_len + tgt.shape[-2], :]
-        # Copy relevant past information from the source to the destination
         dst.copy_(tgt, non_blocking=True)
 
-    # Update the current length tensor (currently only support batch size is 1)
     current_length_data.fill_(prev_input_len + tgt.shape[-2])
 
     prob = sample_p
@@ -1077,7 +811,7 @@ def update_inference_inputs(
     else:
         sample_token = torch.argmax(prob)
         sample_token = sample_token[None, None]
-    # Update the new token counter
+
     new_token_num += accept_length + 1
 
     return input_ids, new_token_num, sample_token

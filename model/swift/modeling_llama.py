@@ -188,7 +188,7 @@ class LlamaAttention(_LlamaAttention):
                 raise ValueError(
                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
-            attn_weights = attn_weights + attention_mask
+            attn_weights = attn_weights + attention_mask.to(attn_weights.device)
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -380,7 +380,7 @@ class LlamaModel(_LlamaModel):
             swift_mask = self.swift_mask
             swift_len = swift_mask.size(-1)
             combined_attention_mask[:, :, -swift_len:, -swift_len:][
-                swift_mask == 0
+                (swift_mask == 0).to(combined_attention_mask.device)
                 ] = combined_attention_mask.min()
 
         return combined_attention_mask

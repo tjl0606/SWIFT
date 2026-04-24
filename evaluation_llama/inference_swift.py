@@ -164,67 +164,96 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
     return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num
 
 
+def _has_layer_skip(model):
+    if not hasattr(model, "get_skip_layers"):
+        return False
+    attn_skip, mlp_skip = model.get_skip_layers()
+    return (len(attn_skip) + len(mlp_skip)) > 0
+
+
+def _build_compressed_input_ids(full_input_ids, retain_ratio=1.0, min_retain_tokens=16, sink_len=4):
+    full_len = full_input_ids.shape[1]
+    keep_len = max(min_retain_tokens, int(full_len * retain_ratio))
+    keep_len = min(keep_len, full_len)
+
+    if keep_len == full_len:
+        return full_input_ids
+
+    if keep_len > sink_len and full_len > keep_len:
+        kept_input_ids = torch.cat([
+            full_input_ids[:, :sink_len],
+            full_input_ids[:, -(keep_len - sink_len):]
+        ], dim=1)
+    else:
+        kept_input_ids = full_input_ids[:, -keep_len:]
+
+    return kept_input_ids
+
+
 def draft_only_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
-                  logits_processor=None, max_steps=512):
+                       logits_processor=None, max_steps=512):
     assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
     input_ids = input_ids.clone()
-    
-    (
-        past_key_values,
-        past_key_values_data,
-        current_length_data,
-    ) = initialize_past_key_values(model.model)
-    model.past_key_values = past_key_values
-    model.past_key_values_data = past_key_values_data
-    model.current_length_data = current_length_data
-    
+
     model.draft_kv_compress = statistics.get("draft_kv_compress", False)
     model.draft_kv_retain_ratio = statistics.get("draft_kv_retain_ratio", 1.0)
-    
-    reset_swift_mode(model)
-    
-    with torch.inference_mode():
-        outputs, logits = swift_verify(model, input_ids, past_key_values=past_key_values)
-        if logits_processor is not None:
-            last_logits = logits[:, -1]
-            last_logits = logits_processor(None, last_logits)
-            probabilities = torch.nn.functional.softmax(last_logits, dim=1)
-            sample_token = torch.multinomial(probabilities, 1)
-        else:
-            sample_token = torch.argmax(logits[:, -1])[None, None]
-            
-        swift_logits, top1_prob = swift_draft(
-            model,
-            input_ids=sample_token,
-            full_input_ids=input_ids,
-            new_token_num=0,
-            past_key_values_data=past_key_values_data,
-            current_length_data=current_length_data,
-            max_new_tokens=max_new_tokens,
-            logits_processor=logits_processor,
-            max_step_draft=max_new_tokens,
-            stop_threshold=-1.0,
-        )
-        
-    (ss_token, ss_prob, ss_op) = swift_logits
-    drafted_tokens = []
-    for step_token in ss_token:
-        if len(step_token.shape) == 3:
-            tok = step_token[0, 0, 0].item()
-        else:
-            tok = step_token[0, 0].item()
-        drafted_tokens.append(tok)
-        if tok == tokenizer.eos_token_id:
-            break
-            
-    drafted_tensor = torch.tensor([drafted_tokens], dtype=torch.long, device=input_ids.device)
-    output_ids = torch.cat([input_ids, sample_token, drafted_tensor], dim=1)
-    
-    new_token_num = output_ids.shape[1] - input_ids.shape[1]
-    accept_length_list = [1] * new_token_num
-    
-    return output_ids, new_token_num, new_token_num, accept_length_list, new_token_num
 
+    reset_swift_mode(model)
+    model.model.swift_mask = None
+
+    generated_ids = input_ids.clone()
+    accept_length_list = []
+    use_draft_mode = _has_layer_skip(model)
+
+    with torch.inference_mode():
+        for step in range(min(max_new_tokens, max_steps)):
+            # Build the actual context seen by the decoder
+            if model.draft_kv_compress and model.draft_kv_retain_ratio < 0.9999:
+                context_ids = _build_compressed_input_ids(
+                    generated_ids,
+                    retain_ratio=model.draft_kv_retain_ratio,
+                    min_retain_tokens=16,
+                    sink_len=4,
+                )
+            else:
+                context_ids = generated_ids
+
+            model.model.swift_mask = None
+
+            # No layer skip -> use the normal full model path
+            # With layer skip -> use self_draft mode
+            if use_draft_mode:
+                with model.self_draft():
+                    outputs = model.model(
+                        input_ids=context_ids,
+                        attention_mask=None,
+                        past_key_values=None,
+                    )
+            else:
+                outputs = model.model(
+                    input_ids=context_ids,
+                    attention_mask=None,
+                    past_key_values=None,
+                )
+
+            logits = model.lm_head(outputs[0])
+            last_logits = logits[:, -1]
+
+            if logits_processor is not None:
+                proc_logits = logits_processor(None, last_logits)
+                probabilities = torch.nn.functional.softmax(proc_logits, dim=-1)
+                next_token = torch.multinomial(probabilities, 1)
+            else:
+                next_token = torch.argmax(last_logits, dim=-1, keepdim=True)
+
+            generated_ids = torch.cat([generated_ids, next_token.to(generated_ids.device)], dim=1)
+            accept_length_list.append(1)
+
+            if next_token.item() == tokenizer.eos_token_id:
+                break
+
+    new_token_num = generated_ids.shape[1] - input_ids.shape[1]
+    return generated_ids, new_token_num, new_token_num, accept_length_list, new_token_num
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -384,7 +413,7 @@ if __name__ == "__main__":
         args.model_path,
         torch_dtype=str_to_torch_dtype(args.dtype),
         low_cpu_mem_usage=True,
-        device_map="auto")
+        device_map={"": 0})
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 
@@ -400,10 +429,12 @@ if __name__ == "__main__":
                                                                                   task_name=args.task_name)
     else:
         # Unified layer set initialization
-        # _attn_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)  # keep the first and last layer
-        # _mlp_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)
-        _attn_skip_layer_id_set = []  
-        _mlp_skip_layer_id_set = []
+        # with layer skip
+        _attn_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)  # keep the first and last layer
+        _mlp_skip_layer_id_set = np.arange(1, model.config.num_hidden_layers - 1, 2)
+        # without layer skip
+        # _attn_skip_layer_id_set = []  
+        # _mlp_skip_layer_id_set = []
 
     model.set_skip_layers(_attn_skip_layer_id_set, _mlp_skip_layer_id_set)
 

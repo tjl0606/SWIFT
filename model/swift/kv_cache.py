@@ -131,31 +131,24 @@ def initialize_past_key_values(model):
         config.num_hidden_layers * 2, dtype=torch.long, device="cpu"
     )
     # Creating a KVCache for each pair of key and value in all layers
-    past_key_values = [] * config.num_hidden_layers
+    past_key_values = []
 
+    device_group_id = 0
     bias = 0
-    start_data_m = devices[0].index
+    current_device = devices[0]
     for i in range(config.num_hidden_layers):
-        data_m = devices[i].index
-        if data_m != start_data_m:
+        if devices[i] != current_device:
+            device_group_id += 1
             bias = 0
-            start_data_m = data_m
-        try:
-            past_key_values.append(
-                [
-                    KVCache(past_key_values_data_list[data_m - devices[0].index][2 * bias + j],
-                            current_length_data[i * 2 + j])
-                    for j in range(2)
-                ]
-            )
-        except:
-            past_key_values.append(
-                [
-                    KVCache(past_key_values_data_list[0][2 * bias + j],
-                            current_length_data[i * 2 + j])
-                    for j in range(2)
-                ]
-            )
+            current_device = devices[i]
+
+        past_key_values.append(
+            [
+                KVCache(past_key_values_data_list[device_group_id][2 * bias + j],
+                        current_length_data[i * 2 + j])
+                for j in range(2)
+            ]
+        )
         bias += 1
     return past_key_values, past_key_values_data_list, current_length_data
 
@@ -186,30 +179,23 @@ def clone_past_key_values(model, past_key_values_data_list, current_length_data)
         devices.append(device)
 
     # Creating a KVCache for each pair of key and value in all layers
-    past_key_values = [] * num_hidden_layers
+    past_key_values = []
 
+    device_group_id = 0
     bias = 0
-    start_data_m = devices[0].index
+    current_device = devices[0]
     for i in range(num_hidden_layers):
-        data_m = devices[i].index
-        if data_m != start_data_m:
+        if devices[i] != current_device:
+            device_group_id += 1
             bias = 0
-            start_data_m = data_m
-        try:
-            past_key_values.append(
-                [
-                    KVCache(past_key_values_data_list[data_m - devices[0].index][2 * bias + j],
-                            current_length_data[i * 2 + j])
-                    for j in range(2)
-                ]
-            )
-        except:
-            past_key_values.append(
-                [
-                    KVCache(past_key_values_data_list[0][2 * bias + j],
-                            current_length_data[i * 2 + j])
-                    for j in range(2)
-                ]
-            )
+            current_device = devices[i]
+
+        past_key_values.append(
+            [
+                KVCache(past_key_values_data_list[device_group_id][2 * bias + j],
+                        current_length_data[i * 2 + j])
+                for j in range(2)
+            ]
+        )
         bias += 1
     return past_key_values

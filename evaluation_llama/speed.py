@@ -58,19 +58,19 @@ if __name__ == "__main__":
     datanum = 1000
     parser.add_argument(
         "--file-path",
-        default=f'../test/{dataset}/{dataset}_{datanum}/model_answer/codellama-13b/codellama-13b-swift.jsonl',
+        default=f'../test/{dataset}/{dataset}_{datanum}/model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift.jsonl',
         type=str,
         help="The file path of evaluated Speculative Decoding methods.",
     )
     parser.add_argument(
         "--base-path",
-        default=f'../test/{dataset}/{dataset}_{datanum}/model_answer/codellama-13b/codellama-13b-vanilla.jsonl',
+        default=f'../test/{dataset}/{dataset}_{datanum}/model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-vanilla.jsonl',
         type=str,
         help="The file path of evaluated baseline.",
     )
     parser.add_argument(
         "--tokenizer-path",
-        default='/data/models/Llama-2-13b-hf',
+        default='/home/tjlin/models/Meta-Llama-3-8B-Instruct',
         type=str,
         help="The file path of evaluated baseline.",
     )

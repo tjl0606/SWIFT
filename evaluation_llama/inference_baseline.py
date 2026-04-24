@@ -102,7 +102,7 @@ if __name__ == "__main__":
         args.model_path,
         torch_dtype=str_to_torch_dtype(args.dtype),
         low_cpu_mem_usage=True,
-        device_map="auto"
+        device_map={"": 0}
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
