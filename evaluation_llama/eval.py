@@ -297,6 +297,8 @@ def get_model_answers(
     total_scored = 0
 
     os.makedirs(os.path.dirname(answer_file), exist_ok=True)
+    with open(os.path.expanduser(answer_file), "w", encoding="utf-8"):
+        pass
 
     for question_idx, question in enumerate(tqdm(data)):
         choices = []

@@ -14,6 +14,7 @@ def draft_only_forward(input_ids, model, tokenizer, max_new_tokens, statistics=N
     
     model.draft_kv_compress = statistics.get("draft_kv_compress", False)
     model.draft_kv_retain_ratio = statistics.get("draft_kv_retain_ratio", 1.0)
+    draft_token_num = statistics.get("draft_token_num", None)
     
     reset_swift_mode(model)
     
@@ -38,6 +39,7 @@ def draft_only_forward(input_ids, model, tokenizer, max_new_tokens, statistics=N
             logits_processor=logits_processor,
             max_step_draft=max_new_tokens,
             stop_threshold=-1.0,
+            draft_token_num=draft_token_num,
         )
         
     (ss_token, ss_prob, ss_op) = swift_logits

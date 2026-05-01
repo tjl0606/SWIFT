@@ -8,6 +8,10 @@ import numpy as np
 from .kv_cache import clone_past_key_values
 
 TOPK = 10  # topk for sparse tree
+SMART_KV_SINK_LEN = 4
+SMART_KV_OBSERVATION_WINDOW = 32
+SMART_KV_RECENT_FRACTION = 0.5
+SMART_KV_POOL_KERNEL = 7
 
 from transformers.generation.logits_process import (
     LogitsProcessorList,
@@ -61,6 +65,57 @@ def get_cache_configuration(file_name='skip_layers.json', model_name='llama-2-13
         else:
             print(f"Use cached configuration in {file_name}.")
             return data[f'{model_name}_{task_name}']['attention'], data[f'{model_name}_{task_name}']['mlp']
+
+
+def _skip_layer_list(values):
+    return [int(x) for x in list(values)]
+
+
+def get_skip_layer_cache(file_name, cache_key):
+    """
+    Load a benchmark-specific skip-layer configuration.
+    """
+    if not os.path.exists(file_name):
+        print(f"Skip-layer cache file not found: {file_name}")
+        return None
+
+    with open(file_name, encoding="utf-8") as f:
+        data = json.load(f)
+
+    if cache_key not in data:
+        print(f"Skip-layer cache key not found: {cache_key}")
+        return None
+
+    entry = data[cache_key]
+    print(f"Use skip-layer cache '{cache_key}' from {file_name}.")
+    return entry["attention"], entry["mlp"]
+
+
+def save_skip_layer_cache(file_name, cache_key, attn_skip_layers, mlp_skip_layers, metadata=None):
+    """
+    Save a benchmark-specific skip-layer configuration.
+    """
+    cache_dir = os.path.dirname(file_name)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+
+    if os.path.exists(file_name):
+        with open(file_name, encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = {}
+
+    data[cache_key] = {
+        "attention": _skip_layer_list(attn_skip_layers),
+        "mlp": _skip_layer_list(mlp_skip_layers),
+        "metadata": metadata or {},
+    }
+
+    with open(file_name, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+    print(f"Saved skip-layer cache '{cache_key}' to {file_name}.")
 
 
 def get_choices_list(prob_list, logits_processor=None):
@@ -243,7 +298,8 @@ def generate_swift_buffers(swift_choices, device="cuda"):
     return swift_buffers
 
 
-def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key_values_data, current_length_data, logits_processor=None):
+def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key_values_data, current_length_data,
+                     logits_processor=None, draft_token_num=None):
     """
     Initializes the swift structure for a given model.
     """
@@ -270,6 +326,7 @@ def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key
             current_length_data=current_length_data,
             max_new_tokens=max_new_tokens,
             logits_processor=logits_processor,
+            draft_token_num=draft_token_num,
         )
     return swift_logits, sample_token, top1_prob
 
@@ -321,6 +378,183 @@ def sample(logits, logits_processor, k=1):
     return sampled_indices, sampled_probs, probabilities
 
 
+def _clone_past_key_values_data(past_key_values_data):
+    return [x.clone() for x in past_key_values_data]
+
+
+def _copy_past_key_values(model, past_key_values_data, current_length_data):
+    draft_past_key_values_data = _clone_past_key_values_data(past_key_values_data)
+    draft_current_length_data = current_length_data.clone()
+    draft_past_key_values = clone_past_key_values(
+        model, draft_past_key_values_data, draft_current_length_data
+    )
+    return draft_past_key_values_data, draft_current_length_data, draft_past_key_values
+
+
+def _pool_token_scores(scores, kernel_size=SMART_KV_POOL_KERNEL):
+    if scores is None or scores.numel() == 0 or kernel_size <= 1:
+        return scores
+    padding = kernel_size // 2
+    pooled = torch.nn.functional.max_pool1d(
+        scores.view(1, 1, -1),
+        kernel_size=kernel_size,
+        stride=1,
+        padding=padding,
+    ).view(-1)
+    return pooled[: scores.numel()]
+
+
+def _get_observation_attention_scores(
+        model,
+        full_input_ids,
+        past_key_values_data,
+        current_length_data,
+        observation_window=SMART_KV_OBSERVATION_WINDOW,
+):
+    """
+    Estimate token importance from the draft model's attention over a short
+    observation window at the end of the current sequence.
+    """
+    if full_input_ids is None or full_input_ids.shape[1] <= 1:
+        return None
+
+    full_len = full_input_ids.shape[1]
+    obs_len = min(observation_window, full_len)
+    prefix_len = full_len - obs_len
+    device = past_key_values_data[0].device if len(past_key_values_data) > 0 else full_input_ids.device
+    obs_input_ids = full_input_ids[:, prefix_len:].to(device)
+    obs_position_ids = torch.arange(prefix_len, full_len, device=device).unsqueeze(0)
+
+    score_past_key_values = None
+    if prefix_len > 0:
+        score_past_key_values_data = _clone_past_key_values_data(past_key_values_data)
+        score_current_length_data = current_length_data.clone()
+        score_current_length_data.fill_(prefix_len)
+        score_past_key_values = clone_past_key_values(
+            model, score_past_key_values_data, score_current_length_data
+        )
+
+    _clear_swift_tree_state(model)
+
+    try:
+        with torch.inference_mode():
+            with model.self_draft():
+                outputs = model.model(
+                    input_ids=obs_input_ids,
+                    attention_mask=None,
+                    past_key_values=score_past_key_values,
+                    position_ids=obs_position_ids,
+                    output_attentions=True,
+                    use_cache=False,
+                    return_dict=True,
+                )
+    except Exception as exc:
+        logging.warning("Smart draft KV scoring failed; falling back to heuristic compression: %s", exc)
+        _clear_swift_tree_state(model)
+        return None
+
+    attentions = getattr(outputs, "attentions", None)
+    if not attentions:
+        return None
+
+    scores = torch.zeros(full_len, device=device, dtype=torch.float32)
+    layer_count = 0
+    for attn in attentions:
+        if attn is None:
+            continue
+        attn = attn.detach().float()
+        if attn.shape[-1] < full_len:
+            continue
+        scores += attn[0, :, :, :full_len].mean(dim=(0, 1))
+        layer_count += 1
+
+    if layer_count == 0:
+        return None
+
+    scores = scores / layer_count
+    return _pool_token_scores(scores)
+
+
+def _fill_indices_evenly(candidate_indices, num_to_fill):
+    if num_to_fill <= 0 or candidate_indices.numel() == 0:
+        return candidate_indices.new_empty(0)
+    if candidate_indices.numel() <= num_to_fill:
+        return candidate_indices
+    pick = torch.linspace(
+        0,
+        candidate_indices.numel() - 1,
+        steps=num_to_fill,
+        device=candidate_indices.device,
+    ).round().long()
+    return candidate_indices[pick].unique(sorted=True)
+
+
+def _select_smart_kv_indices(
+        full_input_ids,
+        keep_len,
+        scores=None,
+        sink_len=SMART_KV_SINK_LEN,
+        recent_fraction=SMART_KV_RECENT_FRACTION,
+):
+    """
+    Select a fixed-size KV budget using sink + recent + attention-heavy tokens.
+    The final indices are sorted so the compressed cache keeps causal order.
+    """
+    full_len = full_input_ids.shape[1]
+    device = full_input_ids.device
+
+    if keep_len >= full_len:
+        return torch.arange(full_len, device=device, dtype=torch.long)
+
+    keep_mask = torch.zeros(full_len, device=device, dtype=torch.bool)
+
+    sink_count = min(sink_len, keep_len, full_len)
+    if sink_count > 0:
+        keep_mask[:sink_count] = True
+
+    remaining = keep_len - int(keep_mask.sum().item())
+    if remaining > 0:
+        recent_count = max(1, int(keep_len * recent_fraction))
+        recent_count = min(recent_count, remaining, full_len)
+        keep_mask[full_len - recent_count:] = True
+
+    remaining = keep_len - int(keep_mask.sum().item())
+    if remaining > 0:
+        candidate_indices = torch.nonzero(~keep_mask, as_tuple=True)[0]
+        if scores is not None and scores.numel() == full_len:
+            candidate_scores = scores.to(device=device)[candidate_indices]
+            topk = min(remaining, candidate_indices.numel())
+            selected = candidate_indices[torch.topk(candidate_scores, k=topk).indices]
+        else:
+            selected = _fill_indices_evenly(candidate_indices, remaining)
+        keep_mask[selected] = True
+
+    remaining = keep_len - int(keep_mask.sum().item())
+    if remaining > 0:
+        candidate_indices = torch.nonzero(~keep_mask, as_tuple=True)[0]
+        keep_mask[candidate_indices[-remaining:]] = True
+
+    return torch.nonzero(keep_mask, as_tuple=True)[0]
+
+
+def _copy_selected_kv_cache(model, past_key_values_data, current_length_data, keep_indices):
+    draft_past_key_values_data = []
+    for past_key_values_data_item in past_key_values_data:
+        compressed_data = past_key_values_data_item.clone()
+        compressed_data.zero_()
+        local_indices = keep_indices.to(past_key_values_data_item.device)
+        selected_data = past_key_values_data_item.index_select(-2, local_indices)
+        compressed_data[..., : keep_indices.numel(), :].copy_(selected_data, non_blocking=True)
+        draft_past_key_values_data.append(compressed_data)
+
+    draft_current_length_data = current_length_data.clone()
+    draft_current_length_data.fill_(keep_indices.numel())
+    draft_past_key_values = clone_past_key_values(
+        model, draft_past_key_values_data, draft_current_length_data
+    )
+    return draft_past_key_values_data, draft_current_length_data, draft_past_key_values
+
+
 @torch.no_grad()
 def swift_draft(
         model,
@@ -334,6 +568,7 @@ def swift_draft(
         max_step_draft=25,
         logits_processor=None,
         stop_threshold=0.8,
+        draft_token_num=None,
 ):
     """
     Draft new tokens using the swift structure.
@@ -352,26 +587,38 @@ def swift_draft(
             # sink_tokens=4,
         )
     else:
-        draft_past_key_values_data = []
-        for i in range(len(past_key_values_data)):
-            draft_past_key_values_data.append(past_key_values_data[i].clone())
-        draft_current_length_data = current_length_data.clone()
-        draft_past_key_values = clone_past_key_values(
-            model, draft_past_key_values_data, draft_current_length_data
+        draft_past_key_values_data, draft_current_length_data, draft_past_key_values = _copy_past_key_values(
+            model, past_key_values_data, current_length_data
         )
 
     # Be explicit again after rebuilding / cloning cache
     _clear_swift_tree_state(model)
 
     ss_token, ss_prob, ss_op, top1_prob = [], [], [], []
+    draft_position = full_input_ids.shape[1] if full_input_ids is not None else None
+    use_fixed_draft_tokens = draft_token_num is not None
+    if use_fixed_draft_tokens:
+        if draft_token_num <= 0:
+            raise ValueError("draft_token_num must be a positive integer when set.")
+        max_step_draft = min(max_step_draft, draft_token_num)
+
     with torch.inference_mode():
         for step_draft in range(max_step_draft):
+            step_position_ids = position_ids
+            if step_position_ids is None and draft_position is not None:
+                step_position_ids = torch.arange(
+                    draft_position,
+                    draft_position + input_ids.shape[1],
+                    dtype=torch.long,
+                    device=input_ids.device,
+                ).unsqueeze(0)
+
             with model.self_draft():
                 draft_outputs = model.model(
                     input_ids=input_ids,
                     attention_mask=None,
                     past_key_values=draft_past_key_values,
-                    position_ids=position_ids,
+                    position_ids=step_position_ids,
                 )
             current_draft_logits = model.lm_head(draft_outputs[0])
 
@@ -393,8 +640,12 @@ def swift_draft(
             current_threshold = argmax_prob.item()
             top1_prob.append(current_threshold)
 
-            if current_threshold < stop_threshold or new_token_num + step_draft + 2 >= max_new_tokens:
+            reached_generation_limit = new_token_num + step_draft + 2 >= max_new_tokens
+            if reached_generation_limit or (not use_fixed_draft_tokens and current_threshold < stop_threshold):
                 break
+
+            if draft_position is not None:
+                draft_position += input_ids.shape[1]
 
     return (torch.cat(ss_token), torch.cat(ss_prob), ss_op), top1_prob
 
@@ -415,57 +666,36 @@ def rebuild_compressed_draft_cache(
         min_retain_tokens=16,
 ):
     """
-    Rebuild a draft cache using only the most recent contiguous suffix tokens.
+    Rebuild a draft cache by retaining sink, recent, and attention-heavy tokens.
     """
+    if full_input_ids is None:
+        return _copy_past_key_values(model, past_key_values_data, current_length_data)
+
     full_len = full_input_ids.shape[1]
     keep_len = max(min_retain_tokens, int(full_len * retain_ratio))
     keep_len = min(keep_len, full_len)
 
     if keep_len == full_len:
-        draft_past_key_values_data = []
-        for i in range(len(past_key_values_data)):
-            draft_past_key_values_data.append(past_key_values_data[i].clone())
-        draft_current_length_data = current_length_data.clone()
-        draft_past_key_values = clone_past_key_values(
-            model, draft_past_key_values_data, draft_current_length_data
-        )
-        return draft_past_key_values_data, draft_current_length_data, draft_past_key_values
+        return _copy_past_key_values(model, past_key_values_data, current_length_data)
 
-    sink_len = 4
-    if keep_len > sink_len and full_len > keep_len:
-        kept_input_ids = torch.cat([
-            full_input_ids[:, :sink_len],
-            full_input_ids[:, -(keep_len - sink_len):]
-        ], dim=1)
-    else:
-        kept_input_ids = full_input_ids[:, -keep_len:]
-
-    draft_past_key_values_data = []
-    for i in range(len(past_key_values_data)):
-        x = past_key_values_data[i].clone()
-        x.zero_()
-        draft_past_key_values_data.append(x)
-
-    draft_current_length_data = current_length_data.clone()
-    draft_current_length_data.zero_()
-
-    draft_past_key_values = clone_past_key_values(
-        model, draft_past_key_values_data, draft_current_length_data
-    )
-
-    # Critical fix:
-    # cache rebuild is a normal verify/prefill pass, not tree decoding.
-    # Do not reuse the previous round's swift_mask.
     _clear_swift_tree_state(model)
-
-    with torch.inference_mode():
-        swift_verify(
-            model,
-            input_ids=kept_input_ids,
-            past_key_values=draft_past_key_values,
-        )
-
-    return draft_past_key_values_data, draft_current_length_data, draft_past_key_values
+    scores = _get_observation_attention_scores(
+        model=model,
+        full_input_ids=full_input_ids,
+        past_key_values_data=past_key_values_data,
+        current_length_data=current_length_data,
+    )
+    keep_indices = _select_smart_kv_indices(
+        full_input_ids=full_input_ids,
+        keep_len=keep_len,
+        scores=scores,
+    )
+    return _copy_selected_kv_cache(
+        model=model,
+        past_key_values_data=past_key_values_data,
+        current_length_data=current_length_data,
+        keep_indices=keep_indices,
+    )
 
 
 def reset_past_key_values(past_key_values):
@@ -699,7 +929,13 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
         cur_past_key_values_data.append(input_past_key_values_data[i].clone())
     cur_current_length_data = input_current_length_data.clone()
 
-    if statistics.get("draft_kv_compress", False) and statistics.get("draft_kv_retain_ratio", 1.0) < 0.9999:
+    use_compressed_optimization_kv = (
+        statistics.get("optimize_with_compressed_draft_kv", True)
+        and statistics.get("draft_kv_compress", False)
+        and statistics.get("draft_kv_retain_ratio", 1.0) < 0.9999
+    )
+
+    if use_compressed_optimization_kv:
         cur_past_key_values_data, cur_current_length_data, input_past_key_values = rebuild_compressed_draft_cache(
             model=model,
             full_input_ids=full_input_ids,
@@ -732,11 +968,22 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
     with torch.inference_mode():
         with model.self_draft():
             step_end = statistics["context_window"] + 1
+            optimization_input_ids = generate_ids[:, :step_end]
+            optimization_position_ids = position_ids
+            if optimization_position_ids is None and full_input_ids is not None:
+                prefix_len = full_input_ids.shape[1]
+                optimization_position_ids = torch.arange(
+                    prefix_len,
+                    prefix_len + optimization_input_ids.shape[1],
+                    dtype=torch.long,
+                    device=optimization_input_ids.device,
+                ).unsqueeze(0)
+
             parallel_draft_output = model.model(
-                input_ids=generate_ids[:, :step_end],
+                input_ids=optimization_input_ids,
                 attention_mask=None,
                 past_key_values=input_past_key_values,
-                position_ids=position_ids
+                position_ids=optimization_position_ids
             )
 
     parallel_draft_logits = model.lm_head(parallel_draft_output[0])

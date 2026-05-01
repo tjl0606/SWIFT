@@ -18,6 +18,35 @@ from model.swift.utils import *
 from model.swift.modeling_llama import LlamaForCausalLM
 from model.swift.kv_cache import initialize_past_key_values
 
+
+def _cache_key_part(value):
+    return str(value).replace("/", "_").replace(" ", "_")
+
+
+def build_skip_layer_cache_key(args):
+    draft_token_num = args.draft_token_num if args.draft_token_num is not None else "auto"
+    parts = [
+        args.model_id,
+        args.task_name,
+        f"data-{args.data_num}",
+        f"seed-{args.seed}",
+        f"dtype-{args.dtype}",
+        f"temp-{args.temperature}",
+        f"top-p-{args.top_p}",
+        f"max-new-{args.max_new_tokens}",
+        f"opt-interval-{args.opt_interval}",
+        f"bayes-interval-{args.bayes_interval}",
+        f"max-opt-{args.max_opt_iter}",
+        f"max-tolerance-{args.max_tolerance_iter}",
+        f"max-score-{args.max_score}",
+        f"context-window-{args.context_window}",
+        f"skip-ratio-{args.skip_ratio}",
+        f"draft-token-num-{draft_token_num}",
+        f"opt-compressed-draft-kv-{args.optimize_with_compressed_draft_kv}",
+    ]
+    return "__".join(_cache_key_part(part) for part in parts)
+
+
 def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
                   logits_processor=None, max_steps=512):
     assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
@@ -37,13 +66,15 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
     
     model.draft_kv_compress = statistics.get("draft_kv_compress", False)
     model.draft_kv_retain_ratio = statistics.get("draft_kv_retain_ratio", 1.0)
+    fixed_draft_token_num = statistics.get("draft_token_num", None)
 
     input_len = input_ids.shape[1]
     cur_length = input_len
     reset_swift_mode(model)
     swift_logits, sample_token, top1_prob = initialize_swift(input_ids, model, max_new_tokens,
                                                              past_key_values, past_key_values_data,
-                                                             current_length_data, logits_processor=logits_processor)
+                                                             current_length_data, logits_processor=logits_processor,
+                                                             draft_token_num=fixed_draft_token_num)
 
     # Clone the prefilled past key and value states for swift optimization
     input_past_key_values_data = []
@@ -148,6 +179,7 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             current_length_data=current_length_data,
             max_new_tokens=max_new_tokens,
             logits_processor=logits_processor,
+            draft_token_num=fixed_draft_token_num,
         )
         accept_length_tree = input_ids.shape[1] - cur_length
         cur_length = accept_length_tree + cur_length
@@ -389,18 +421,69 @@ if __name__ == "__main__":
         help="Retain ratio of KV cache during draft. 1.0 means no compression.",
     )
     parser.add_argument(
+        "--optimize-with-compressed-draft-kv",
+        dest="optimize_with_compressed_draft_kv",
+        action="store_true",
+        default=True,
+        help="Use compressed draft KV cache when scoring layer-skip optimization.",
+    )
+    parser.add_argument(
+        "--no-optimize-with-compressed-draft-kv",
+        dest="optimize_with_compressed_draft_kv",
+        action="store_false",
+        help="Use the uncompressed prompt KV cache when scoring layer-skip optimization.",
+    )
+    parser.add_argument(
+        "--draft-token-num",
+        type=int,
+        default=None,
+        help="Fixed number of tokens to draft each SWIFT step. If unset, use stop_threshold.",
+    )
+    parser.add_argument(
         "--draft-only",
         action="store_true",
         default=False,
         help="Use the draft model natively as the main model for decoding.",
     )
+    parser.add_argument(
+        "--skip-layer-cache-file",
+        type=str,
+        default="outputs/skip_layer_cache.json",
+        help="File used to save/load benchmark-specific skip-layer sets.",
+    )
+    parser.add_argument(
+        "--skip-layer-cache-key",
+        type=str,
+        default=None,
+        help="Optional explicit key for the skip-layer cache.",
+    )
+    parser.add_argument(
+        "--save-skip-layer-cache",
+        action="store_true",
+        default=False,
+        help="Save the final optimized skip-layer set after evaluation.",
+    )
+    parser.add_argument(
+        "--load-skip-layer-cache",
+        action="store_true",
+        default=False,
+        help="Load a skip-layer set and disable layer-set optimization.",
+    )
 
     args = parser.parse_args()
+    if args.draft_token_num is not None and args.draft_token_num <= 0:
+        parser.error("--draft-token-num must be a positive integer.")
+    if args.save_skip_layer_cache and args.load_skip_layer_cache:
+        parser.error("--save-skip-layer-cache and --load-skip-layer-cache are mutually exclusive.")
+
+    args.skip_layer_cache_key = args.skip_layer_cache_key or build_skip_layer_cache_key(args)
 
     args.model_name = (args.model_id + "-swift-" + str(args.dtype)+ "-temp-" + str(args.temperature)
                        + "-top-p-" + str(args.top_p) + "-seed-" + str(args.seed) + "-max_new_tokens-" + str(args.max_new_tokens)+ "-opt_interval-" + str(args.opt_interval)
-                       + "-bayes_interval-" + str(args.bayes_interval) + "-max_opt-" + str(args.max_opt_iter) + "-max_tolerance-" + str(args.max_tolerance_iter)
+                    #    + "-bayes_interval-" + str(args.bayes_interval) + "-max_opt-" + str(args.max_opt_iter) + "-max_tolerance-" + str(args.max_tolerance_iter)
                        + "-max_score-" + str(args.max_score) + "-context_window-" + str(args.context_window) + "-skip_ratio-" + str(args.skip_ratio) + "-draft_kv_retain_ratio-" + str(args.draft_kv_retain_ratio)
+                       + "-opt_compressed_draft_kv-" + str(args.optimize_with_compressed_draft_kv)
+                       + ("-draft_token_num-" + str(args.draft_token_num) if args.draft_token_num is not None else "")
                        + ("-draft_only" if args.draft_only else ""))
     answer_file = f"outputs/{args.task_name}/{args.task_name}_{args.data_num}/without_layerskip_draft_model_answer/{args.model_id}/{args.model_name}.jsonl"
     set_logger()
@@ -422,7 +505,17 @@ if __name__ == "__main__":
     else:
         logits_processor = None
 
-    if args.cache_hit:
+    if args.load_skip_layer_cache:
+        cached_skip_layers = get_skip_layer_cache(args.skip_layer_cache_file, args.skip_layer_cache_key)
+        if cached_skip_layers is None:
+            raise FileNotFoundError(
+                f"Skip-layer cache not found for key '{args.skip_layer_cache_key}' "
+                f"in {args.skip_layer_cache_file}."
+            )
+
+        _attn_skip_layer_id_set, _mlp_skip_layer_id_set = cached_skip_layers
+        args.optimization, args.bayes = False, False
+    elif args.cache_hit:
         # Load the cached layer set configuration
         args.optimization, args.bayes=False, False
         _attn_skip_layer_id_set, _mlp_skip_layer_id_set = get_cache_configuration(model_name=args.model_id,
@@ -449,7 +542,9 @@ if __name__ == "__main__":
                   "bayes_interval": args.bayes_interval, "max_opt_iter": args.max_opt_iter,
                   "max_tolerance_iter": args.max_tolerance_iter, "max_score": args.max_score,
                   "context_window": args.context_window, "optimization": args.optimization, "bayes": args.bayes,
-                  "draft_kv_compress": args.draft_kv_compress, "draft_kv_retain_ratio": args.draft_kv_retain_ratio}
+                  "draft_kv_compress": args.draft_kv_compress, "draft_kv_retain_ratio": args.draft_kv_retain_ratio,
+                  "optimize_with_compressed_draft_kv": args.optimize_with_compressed_draft_kv,
+                  "draft_token_num": args.draft_token_num}
 
     forward_f = draft_only_forward if args.draft_only else swift_forward
     run_eval(
@@ -469,3 +564,34 @@ if __name__ == "__main__":
         statistics=statistics,
         logits_processor=logits_processor,
     )
+
+    if args.save_skip_layer_cache:
+        best_attn_skip_layer_id_set, best_mlp_skip_layer_id_set = model.get_skip_layers()
+        save_skip_layer_cache(
+            args.skip_layer_cache_file,
+            args.skip_layer_cache_key,
+            best_attn_skip_layer_id_set,
+            best_mlp_skip_layer_id_set,
+            metadata={
+                "model_id": args.model_id,
+                "task_name": args.task_name,
+                "data_num": args.data_num,
+                "seed": args.seed,
+                "dtype": args.dtype,
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "max_new_tokens": args.max_new_tokens,
+                "opt_interval": args.opt_interval,
+                "bayes_interval": args.bayes_interval,
+                "max_opt_iter": args.max_opt_iter,
+                "max_tolerance_iter": args.max_tolerance_iter,
+                "max_score": args.max_score,
+                "context_window": args.context_window,
+                "skip_ratio": args.skip_ratio,
+                "draft_token_num": args.draft_token_num,
+                "draft_kv_retain_ratio": args.draft_kv_retain_ratio,
+                "optimize_with_compressed_draft_kv": args.optimize_with_compressed_draft_kv,
+                "origin_score": statistics["origin_score"],
+                "opt_iter": statistics["opt_iter"],
+            },
+        )

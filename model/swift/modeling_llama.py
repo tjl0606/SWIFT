@@ -161,7 +161,10 @@ class LlamaAttention(_LlamaAttention):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        rotary_seq_len = kv_seq_len
+        if position_ids is not None:
+            rotary_seq_len = max(rotary_seq_len, int(position_ids.max().item()) + 1)
+        cos, sin = self.rotary_emb(value_states, seq_len=rotary_seq_len)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
@@ -256,6 +259,9 @@ class LlamaDecoderLayer(nn.Module):
                 (see `past_key_values`).
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
+
+        self_attn_weights = None
+        present_key_value = None
 
         if self.training:
 
