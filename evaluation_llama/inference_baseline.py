@@ -4,24 +4,64 @@ Usage:
 python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fastchat-t5-3b-v1.0
 """
 import argparse
+import re
 from fastchat.utils import str_to_torch_dtype
 
 from evaluation_llama.eval import run_eval
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
-def baseline_forward(input_ids, model, tokenizer, max_new_tokens, temperature=0.0, top_p=0.85, do_sample=False):
+
+class RegexStopCriteria(StoppingCriteria):
+    def __init__(self, tokenizer, prompt_length, stop_config):
+        self.tokenizer = tokenizer
+        self.prompt_length = prompt_length
+        self.patterns = [
+            re.compile(pattern, flags=re.IGNORECASE | re.DOTALL)
+            for pattern in stop_config.get("patterns", [])
+        ]
+        self.min_chars_before_match = stop_config.get("min_chars_before_match", 0)
+
+    def __call__(self, input_ids, scores, **kwargs):
+        generated_ids = input_ids[0, self.prompt_length:]
+        if generated_ids.numel() == 0:
+            return False
+
+        text = self.tokenizer.decode(
+            generated_ids,
+            spaces_between_special_tokens=False,
+        )
+        for pattern in self.patterns:
+            for match in pattern.finditer(text):
+                prefix = text[: match.start()].strip()
+                if len(prefix) >= self.min_chars_before_match:
+                    return True
+        return False
+
+
+def baseline_forward(input_ids, model, tokenizer, max_new_tokens, temperature=0.0, top_p=0.85,
+                     do_sample=False, stop_config=None):
     attention_mask = torch.ones(input_ids.shape, dtype=torch.long, device=model.device)
-    output_ids = model.generate(
-        input_ids,
-        attention_mask=attention_mask,
-        do_sample=do_sample,
-        temperature=temperature,
-        top_p=top_p,
-        max_new_tokens=max_new_tokens,
-        pad_token_id=tokenizer.eos_token_id,
-    )
+    stopping_criteria = None
+    if stop_config and stop_config.get("patterns"):
+        stopping_criteria = StoppingCriteriaList([
+            RegexStopCriteria(tokenizer, len(input_ids[0]), stop_config)
+        ])
+
+    generate_kwargs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "do_sample": do_sample,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": tokenizer.eos_token_id,
+    }
+    if stopping_criteria is not None:
+        generate_kwargs["stopping_criteria"] = stopping_criteria
+
+    output_ids = model.generate(**generate_kwargs)
     new_token = len(output_ids[0][len(input_ids[0]):])
     step = new_token
     draft_token_num = new_token

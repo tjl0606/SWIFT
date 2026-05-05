@@ -14,6 +14,7 @@ import random
 import numpy as np
 import re
 
+from collections import Counter
 from tqdm import tqdm
 from datasets import load_dataset
 from human_eval.data import read_problems
@@ -35,7 +36,19 @@ def safe_cuda_synchronize():
 
 
 def normalize_task_name(task_name):
-    return task_name.strip().lower()
+    name = task_name.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "trivia_qa": "triviaqa",
+        "naturalquestions": "natural_questions",
+        "natural_question": "natural_questions",
+        "nq": "natural_questions",
+        "nq_open": "natural_questions",
+    }
+    return aliases.get(name, name)
+
+
+def is_qa_task(task_name):
+    return normalize_task_name(task_name) in {"triviaqa", "natural_questions"}
 
 
 def extract_gsm8k_gold(answer_text):
@@ -47,10 +60,36 @@ def extract_gsm8k_gold(answer_text):
     return matches[-1] if matches else None
 
 
+GSM8K_FINAL_ANSWER_RE = re.compile(
+    r"\bfinal\s+answer\s*[:：]\s*"
+    r"(?:the\s+final\s+answer\s+is\s*)?"
+    r"(?:the\s+answer\s+is\s*)?"
+    r"\$?\s*(?P<number>-?\d[\d,]*(?:\.\d+)?)",
+    flags=re.IGNORECASE,
+)
+
+GSM8K_ANSWER_RE = re.compile(
+    r"\bthe\s+answer\s+is\s*\$?\s*(?P<number>-?\d[\d,]*(?:\.\d+)?)",
+    flags=re.IGNORECASE,
+)
+
+def normalize_number_text(number_text):
+    return number_text.replace(",", "")
+
+
 def extract_gsm8k_pred(output_text):
     text = output_text.strip().replace(",", "")
     if "####" in text:
         text = text.split("####")[-1]
+
+    answer_match = GSM8K_ANSWER_RE.search(output_text)
+    if answer_match:
+        return normalize_number_text(answer_match.group("number"))
+
+    final_match = GSM8K_FINAL_ANSWER_RE.search(output_text)
+    if final_match:
+        return normalize_number_text(final_match.group("number"))
+
     matches = re.findall(r"-?\d+(?:\.\d+)?", text)
     return matches[-1] if matches else None
 
@@ -75,6 +114,10 @@ def extract_mmlu_gold(example):
 def extract_mmlu_pred(output_text):
     text = output_text.strip().upper()
 
+    first_answer = re.search(r"^\s*(?:ANSWER\s*[:：]\s*)?([ABCD])(?:\b|[\.\):])", text)
+    if first_answer:
+        return first_answer.group(1)
+
     patterns = [
         r"ANSWER\s*[:：]\s*([ABCD])\b",
         r"THE ANSWER IS\s*([ABCD])\b",
@@ -84,10 +127,185 @@ def extract_mmlu_pred(output_text):
     for pattern in patterns:
         matches = re.findall(pattern, text)
         if matches:
-            return matches[-1]
+            return matches[0]
 
     matches = re.findall(r"\b([ABCD])\b", text)
-    return matches[-1] if matches else None
+    return matches[0] if matches else None
+
+
+def get_generation_stop_config(task_name):
+    task_name = normalize_task_name(task_name)
+    if is_qa_task(task_name):
+        return {
+            "patterns": [
+                r"\bquestion\s*[:：]",
+                r"\.{2,}\s*(?:more|less)\b",
+                r"\b(?:read|show)\s+more\b",
+                r"\bshow\s+less\b",
+                r"\bback\s+to\s+the\s+list\b",
+                r"<\|[^>]*header_id\|>",
+            ],
+        }
+
+    return None
+
+
+def normalize_qa_answer(text):
+    text = str(text).lower()
+    text = re.sub(r"\b(a|an|the)\b", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    return " ".join(text.split())
+
+
+def clean_qa_candidate(text):
+    text = text.strip()
+    if not text:
+        return None
+
+    text = re.split(r"<\|", text, maxsplit=1)[0].strip()
+    text = re.split(r"\n+", text, maxsplit=1)[0].strip()
+    text = re.split(
+        r"\b(?:answer\s+the\s+following\s+question|question\s*[:：]|"
+        r"explanation\s*[:：]|because\s*[:：])",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    text = re.sub(r"\.{2,}\s*(?:more|less)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:read\s+more|more|less)\b", " ", text, flags=re.IGNORECASE)
+    text = re.split(r"\s+#", text, maxsplit=1)[0].strip()
+
+    prefix_pattern = re.compile(
+        r"^(?:final\s+answer\s*[:：-]\s*|answer\s*[:：-]\s*|"
+        r"the\s+answer\s+is\s+|answer\s+is\s+|it\s+is\s+|it's\s+)",
+        flags=re.IGNORECASE,
+    )
+    previous = None
+    while previous != text:
+        previous = text
+        text = prefix_pattern.sub("", text).strip()
+
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip(" \t\"'`*_-.。,:;!?()[]{}")
+    return text if text else None
+
+
+def is_placeholder_qa_candidate(text):
+    if not text:
+        return True
+
+    lowered = text.lower()
+    if "_" in text:
+        return True
+    if re.fullmatch(r"(?:one|\d+)\s+words?", lowered):
+        return True
+    if re.fullmatch(r"[\W_]+", text):
+        return True
+    placeholder_markers = (
+        "short phrase",
+        "no explanation",
+        "following question",
+        "fill in the blank",
+        "read more",
+        "show more",
+        "show less",
+        "back to the list",
+    )
+    return any(marker in lowered for marker in placeholder_markers)
+
+
+def extract_qa_pred(output_text):
+    text = output_text.strip()
+    if not text:
+        return None
+
+    candidates = re.split(r"\banswer\s*[:：]", text, flags=re.IGNORECASE)
+    for candidate in candidates:
+        candidate = clean_qa_candidate(candidate)
+        if not is_placeholder_qa_candidate(candidate):
+            return candidate
+
+    fallback = clean_qa_candidate(text)
+    if is_placeholder_qa_candidate(fallback):
+        return None
+    return fallback
+
+
+def clean_qa_output(output_text):
+    pred = extract_qa_pred(output_text)
+    if pred is not None:
+        return pred
+
+    cleaned = clean_qa_candidate(output_text)
+    if is_placeholder_qa_candidate(cleaned):
+        return ""
+    return cleaned or output_text.strip()
+
+
+def qa_f1_score(prediction, gold_answer):
+    pred_tokens = normalize_qa_answer(prediction).split()
+    gold_tokens = normalize_qa_answer(gold_answer).split()
+    if not pred_tokens or not gold_tokens:
+        return float(pred_tokens == gold_tokens)
+
+    common = Counter(pred_tokens) & Counter(gold_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(gold_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def qa_exact_match_score(prediction, gold_answer):
+    return float(normalize_qa_answer(prediction) == normalize_qa_answer(gold_answer))
+
+
+def score_qa_prediction(prediction, gold_answers):
+    gold_answers = [answer for answer in gold_answers if str(answer).strip()]
+    if prediction is None or not gold_answers:
+        return 0.0, 0.0
+
+    exact_match = max(qa_exact_match_score(prediction, answer) for answer in gold_answers)
+    f1 = max(qa_f1_score(prediction, answer) for answer in gold_answers)
+    return exact_match, f1
+
+
+def extract_qa_gold_answers(example, task_name):
+    task_name = normalize_task_name(task_name)
+    gold_answers = []
+
+    if task_name == "triviaqa":
+        answer = example.get("answer", {})
+        if isinstance(answer, dict):
+            for key in ("value", "aliases", "normalized_value", "normalized_aliases"):
+                value = answer.get(key)
+                if isinstance(value, list):
+                    gold_answers.extend(value)
+                elif value:
+                    gold_answers.append(value)
+        elif isinstance(answer, list):
+            gold_answers.extend(answer)
+        elif answer:
+            gold_answers.append(answer)
+
+    elif task_name == "natural_questions":
+        answer = example.get("answer", [])
+        if isinstance(answer, list):
+            gold_answers.extend(answer)
+        elif answer:
+            gold_answers.append(answer)
+
+    deduped = []
+    seen = set()
+    for answer in gold_answers:
+        answer = str(answer).strip()
+        if answer and answer not in seen:
+            deduped.append(answer)
+            seen.add(answer)
+
+    return deduped
 
 
 def clip_input(
@@ -137,14 +355,32 @@ def clip_input(
             inputs = tokenizer(raw_prompt, return_tensors="pt").to(device)
 
     elif task_name == "gsm8k":
-        prompt_text = (
-            prompt_shots
-            + "Question: "
-            + prompt["question"].strip()
-            + "\nAnswer: Let's think step by step."
-        )
-        end_prompt = "\nAnswer: Let's think step by step."
-        inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+        if is_instruct and hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+            user_content = (
+                prompt_shots
+                + "Solve the following grade school math problem. "
+                + "Show your reasoning step by step, and finish with a concise final sentence "
+                + "in the form: The answer is <number>.\n\n"
+                + "Question: "
+                + prompt["question"].strip()
+            )
+            messages = [
+                {"role": "system", "content": "You are a helpful assistant that solves math word problems."},
+                {"role": "user", "content": user_content},
+            ]
+            formatted = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = tokenizer(formatted, return_tensors="pt").to(device)
+        else:
+            prompt_text = (
+                prompt_shots
+                + "Question: "
+                + prompt["question"].strip()
+                + "\nAnswer: Let's think step by step."
+            )
+            end_prompt = "\nAnswer: Let's think step by step."
+            inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
 
     elif task_name == "mmlu":
         choices = prompt["choices"]
@@ -157,6 +393,17 @@ def clip_input(
             + f"B. {choices[1]}\n"
             + f"C. {choices[2]}\n"
             + f"D. {choices[3]}\n"
+            + "Answer:"
+        )
+        end_prompt = "\nAnswer:"
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+
+    elif is_qa_task(task_name):
+        prompt_text = (
+            prompt_shots
+            + "Answer the following question with only the final short phrase. "
+            + "Do not include an explanation, repeated answers, or another question.\n\n"
+            + f"Question: {prompt['question'].strip()}\n"
             + "Answer:"
         )
         end_prompt = "\nAnswer:"
@@ -230,6 +477,18 @@ def load_data(task_name, seed, data_num=10):
             dataset = dataset.select(range(data_num))
         data = dataset
 
+    elif task_name == "triviaqa":
+        dataset = load_dataset("mandarjoshi/trivia_qa", "rc.nocontext", split="validation").shuffle(seed=seed)
+        if data_num is not None and data_num < len(dataset):
+            dataset = dataset.select(range(data_num))
+        data = dataset
+
+    elif task_name == "natural_questions":
+        dataset = load_dataset("google-research-datasets/nq_open", "nq_open", split="validation").shuffle(seed=seed)
+        if data_num is not None and data_num < len(dataset):
+            dataset = dataset.select(range(data_num))
+        data = dataset
+
     else:
         raise ValueError(f"Unsupported task: {task_name}")
 
@@ -291,10 +550,18 @@ def get_model_answers(
     cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     print("CUDA VISIBLE DEVICES:", cuda_visible_devices)
 
+    generation_stop_config = get_generation_stop_config(task_name)
+    forward_kwargs = dict(kwargs)
+    if generation_stop_config is not None:
+        forward_kwargs["stop_config"] = generation_stop_config
+
     accept_lengths_tree = []
     total_draft_num = 0
     total_correct = 0
     total_scored = 0
+    total_qa_exact_match = 0.0
+    total_qa_f1 = 0.0
+    total_qa_scored = 0
 
     os.makedirs(os.path.dirname(answer_file), exist_ok=True)
     with open(os.path.expanduser(answer_file), "w", encoding="utf-8"):
@@ -327,7 +594,7 @@ def get_model_answers(
             model,
             tokenizer,
             max_new_tokens,
-            **kwargs,
+            **forward_kwargs,
         )
         safe_cuda_synchronize()
         total_time = time.time() - start_time
@@ -347,6 +614,8 @@ def get_model_answers(
             else:
                 output = output.replace(special_token, "")
         output = output.strip()
+        if is_qa_task(task_name):
+            output = clean_qa_output(output)
 
         steps.append(int(step))
         new_tokens.append(int(new_token_num))
@@ -397,6 +666,25 @@ def get_model_answers(
             sample_record["pred_answer"] = pred
             sample_record["correct"] = sample_correct
 
+        elif is_qa_task(task_name):
+            gold_answers = extract_qa_gold_answers(question, task_name)
+            pred = extract_qa_pred(output)
+            exact_match, f1 = score_qa_prediction(pred, gold_answers)
+            sample_correct = exact_match == 1.0
+
+            sample_record["question"] = question["question"]
+            if "question_id" in question:
+                sample_record["question_id"] = question["question_id"]
+            sample_record["gold_answers"] = gold_answers
+            sample_record["pred_answer"] = pred
+            sample_record["exact_match"] = exact_match
+            sample_record["f1"] = f1
+            sample_record["correct"] = sample_correct
+
+            total_qa_exact_match += exact_match
+            total_qa_f1 += f1
+            total_qa_scored += 1
+
         if sample_correct is not None:
             total_scored += 1
             total_correct += int(sample_correct)
@@ -437,13 +725,17 @@ def get_model_answers(
         ) / ((model.config.num_hidden_layers - 2) * 2)
 
         summary["Best Skip Ratio"] = best_skip_ratio
-        summary["Best Attn Layer Set"] = best_attn_skip_layer_id_set
-        summary["Best MLP Layer Set"] = best_mlp_skip_layer_id_set
+        summary["Best Attn Layer Set"] = [int(x) for x in list(best_attn_skip_layer_id_set)]
+        summary["Best MLP Layer Set"] = [int(x) for x in list(best_mlp_skip_layer_id_set)]
 
     if total_scored > 0:
         summary["Accuracy"] = total_correct / total_scored
         summary["Total Correct"] = total_correct
         summary["Total Scored"] = total_scored
+
+    if total_qa_scored > 0:
+        summary["Exact Match"] = total_qa_exact_match / total_qa_scored
+        summary["F1"] = total_qa_f1 / total_qa_scored
 
     with open(os.path.expanduser(answer_file), "a", encoding="utf-8") as fout:
         fout.write(json.dumps(summary, ensure_ascii=False) + "\n")
@@ -454,3 +746,7 @@ def get_model_answers(
         print("Token acceptance rate:", summary["Token acceptance rate"])
     if "Accuracy" in summary:
         print("Accuracy:", summary["Accuracy"])
+    if "Exact Match" in summary:
+        print("Exact Match:", summary["Exact Match"])
+    if "F1" in summary:
+        print("F1:", summary["F1"])

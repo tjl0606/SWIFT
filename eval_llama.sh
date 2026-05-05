@@ -19,10 +19,14 @@ SKIP_RATIO=0.45
 DRAFT_TOKEN_NUM=3 # e.g. 8; leave empty to use stop_threshold
 OPTIMIZE_WITH_COMPRESSED_DRAFT_KV=0 # 1: optimize layer skips with compressed KV, 0: use uncompressed KV
 
-TASK_NAME="gsm8k" # cnndm, humaneval
-DATA_NUM=100
-MAX_NEW_TOKENS=256
+TASK_NAME="triviaqa" # gsm8k, mmlu, triviaqa, natural_questions, cnndm, humaneval
+DATA_NUM=1000
+MAX_NEW_TOKENS=32 # 32 for short QA; 64 for longer QA runs; 256 others
 TOP_P=1.0
+
+if [ "${MAX_NEW_TOKENS}" -le 32 ]; then
+  CONTEXT_WINDOW=16
+fi
 
 torch_dtype="bfloat16" # ["float32", "float64", "float16", "bfloat16"]
 DRAFT_TOKEN_ARG=""
@@ -62,7 +66,7 @@ run_skip_layer_calibration() {
 
 run_swift_benchmark() {
   run_skip_layer_calibration
-  for RETAIN_RATIO in 0.6 0.5; do
+  for RETAIN_RATIO in 1.0 0.99 0.9 0.8 0.7 0.6; do
     run_swift_eval ${RETAIN_RATIO} "${LOAD_SKIP_LAYER_CACHE_ARG}"
   done
 }
@@ -71,6 +75,6 @@ CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation_llama.inference_baselin
 
 run_swift_benchmark
 
-TASK_NAME="mmlu"
+TASK_NAME="natural_questions"
 
 run_swift_benchmark

@@ -4,6 +4,7 @@ Usage:
 python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fastchat-t5-3b-v1.0
 """
 import argparse
+import re
 from pyexpat import model
 import statistics
 
@@ -47,8 +48,63 @@ def build_skip_layer_cache_key(args):
     return "__".join(_cache_key_part(part) for part in parts)
 
 
+def _compile_stop_patterns(stop_config):
+    if not stop_config or not stop_config.get("patterns"):
+        return []
+    return [
+        re.compile(pattern, flags=re.IGNORECASE | re.DOTALL)
+        for pattern in stop_config["patterns"]
+    ]
+
+
+def _should_stop_generation(input_ids, input_len, tokenizer, stop_patterns, stop_config=None):
+    if not stop_patterns:
+        return False
+
+    generated_ids = input_ids[0, input_len:]
+    if generated_ids.numel() == 0:
+        return False
+
+    min_chars_before_match = 0
+    if stop_config:
+        min_chars_before_match = stop_config.get("min_chars_before_match", 0)
+
+    generated_text = tokenizer.decode(
+        generated_ids,
+        spaces_between_special_tokens=False,
+    )
+    for pattern in stop_patterns:
+        for match in pattern.finditer(generated_text):
+            prefix = generated_text[: match.start()].strip()
+            if len(prefix) >= min_chars_before_match:
+                return True
+    return False
+
+
+def _collect_token_ids(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        token_ids = []
+        for item in value:
+            token_ids.extend(_collect_token_ids(item))
+        return token_ids
+    return [int(value)]
+
+
+def _get_eos_token_ids(model, tokenizer):
+    eos_token_ids = set(_collect_token_ids(getattr(tokenizer, "eos_token_id", None)))
+    eos_token_ids.update(_collect_token_ids(getattr(getattr(model, "config", None), "eos_token_id", None)))
+    eos_token_ids.update(_collect_token_ids(getattr(getattr(model, "generation_config", None), "eos_token_id", None)))
+    return eos_token_ids
+
+
+def _contains_eos_token(token_ids, eos_token_ids):
+    return bool(eos_token_ids) and any(int(token_id) in eos_token_ids for token_id in token_ids)
+
+
 def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
-                  logits_processor=None, max_steps=512):
+                  logits_processor=None, max_steps=512, stop_config=None):
     assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
     # Avoid modifying the input_ids in-place
     input_ids = input_ids.clone()
@@ -67,6 +123,8 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
     model.draft_kv_compress = statistics.get("draft_kv_compress", False)
     model.draft_kv_retain_ratio = statistics.get("draft_kv_retain_ratio", 1.0)
     fixed_draft_token_num = statistics.get("draft_token_num", None)
+    stop_patterns = _compile_stop_patterns(stop_config)
+    eos_token_ids = _get_eos_token_ids(model, tokenizer)
 
     input_len = input_ids.shape[1]
     cur_length = input_len
@@ -155,6 +213,18 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
         except Exception as e:
             logging.error(f"Error logging tokens: {e}")
 
+        accept_length_tree = input_ids.shape[1] - cur_length
+        cur_length = accept_length_tree + cur_length
+        accept_length_list.append(accept_length_tree)
+        total_acc_num += accept_length_tree - 1
+
+        if _contains_eos_token(input_ids[0, input_len:].tolist(), eos_token_ids):
+            break
+        if _should_stop_generation(input_ids, input_len, tokenizer, stop_patterns, stop_config):
+            break
+        if new_token_num > max_new_tokens:
+            break
+
         # layer set optimization
         if (new_token_num > (statistics["context_window"] + 1) and statistics["optimization"]
                 and idx % statistics["opt_interval"] == 0):
@@ -181,14 +251,6 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             logits_processor=logits_processor,
             draft_token_num=fixed_draft_token_num,
         )
-        accept_length_tree = input_ids.shape[1] - cur_length
-        cur_length = accept_length_tree + cur_length
-        accept_length_list.append(accept_length_tree)
-        total_acc_num += accept_length_tree - 1
-        if tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
-            break
-        if new_token_num > max_new_tokens:
-            break
     logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
     return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num
 
@@ -223,7 +285,7 @@ def _build_compressed_input_ids(full_input_ids, retain_ratio=1.0, min_retain_tok
 
 
 def draft_only_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, optimizer=None, utility=None,
-                       logits_processor=None, max_steps=512):
+                       logits_processor=None, max_steps=512, stop_config=None):
     assert input_ids.shape[0] == 1, "Only support batch size 1 for now!!"
     input_ids = input_ids.clone()
 
@@ -236,6 +298,9 @@ def draft_only_forward(input_ids, model, tokenizer, max_new_tokens, statistics=N
     generated_ids = input_ids.clone()
     accept_length_list = []
     use_draft_mode = _has_layer_skip(model)
+    input_len = input_ids.shape[1]
+    stop_patterns = _compile_stop_patterns(stop_config)
+    eos_token_ids = _get_eos_token_ids(model, tokenizer)
 
     with torch.inference_mode():
         for step in range(min(max_new_tokens, max_steps)):
@@ -281,7 +346,9 @@ def draft_only_forward(input_ids, model, tokenizer, max_new_tokens, statistics=N
             generated_ids = torch.cat([generated_ids, next_token.to(generated_ids.device)], dim=1)
             accept_length_list.append(1)
 
-            if next_token.item() == tokenizer.eos_token_id:
+            if _contains_eos_token([next_token.item()], eos_token_ids):
+                break
+            if _should_stop_generation(generated_ids, input_len, tokenizer, stop_patterns, stop_config):
                 break
 
     new_token_num = generated_ids.shape[1] - input_ids.shape[1]
