@@ -4,6 +4,17 @@ import numpy as np
 from datasets import load_dataset
 from rouge_score import rouge_scorer
 
+
+def normalize_task_name(task_name):
+    name = task_name.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "sam_sum": "samsum",
+        "sam_sum_dialogue": "samsum",
+        "samsum_dialogue": "samsum",
+    }
+    return aliases.get(name, name)
+
+
 def load_cnndm_references(seed, data_num=10):
     # Using the exact same dataset loading and shuffling as in eval.py
     data = load_dataset('cnn_dailymail', name='3.0.0', split='test').shuffle(seed=seed).select(range(data_num))
@@ -13,10 +24,32 @@ def load_cnndm_references(seed, data_num=10):
         references.append(item['highlights'].replace('\n', ' '))
     return references
 
-def evaluate_rouge(answer_file, seed, data_num):
-    print(f"Loading references from CNN/DM (seed={seed}, data_num={data_num})...")
-    references = load_cnndm_references(seed, data_num)
-    
+
+def load_samsum_references(seed, data_num=10):
+    data = load_dataset("knkarthick/samsum", split="test").shuffle(seed=seed)
+    if data_num is not None and data_num < len(data):
+        data = data.select(range(data_num))
+
+    references = []
+    for item in data:
+        references.append(item["summary"].replace("\n", " "))
+    return references
+
+
+def load_references(task_name, seed, data_num=10):
+    task_name = normalize_task_name(task_name)
+    if task_name == "cnndm":
+        return load_cnndm_references(seed, data_num)
+    if task_name == "samsum":
+        return load_samsum_references(seed, data_num)
+    raise ValueError(f"Unsupported ROUGE task: {task_name}")
+
+
+def evaluate_rouge(answer_file, task_name, seed, data_num):
+    task_name = normalize_task_name(task_name)
+    print(f"Loading references from {task_name} (seed={seed}, data_num={data_num})...")
+    references = load_references(task_name, seed, data_num)
+
     print(f"Loading predictions from {answer_file}...")
     predictions = []
     with open(answer_file, 'r') as f:
@@ -60,10 +93,11 @@ def evaluate_rouge(answer_file, seed, data_num):
     print(f"ROUGE-L: {np.mean(rL_fmeasures):.4f}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate generated JSONL answers against CNN/DM with ROUGE")
+    parser = argparse.ArgumentParser(description="Evaluate generated JSONL answers with ROUGE")
     parser.add_argument("--answer-file", type=str, required=True, help="Path to the JSONL output file")
+    parser.add_argument("--task-name", type=str, default="cnndm", help="Benchmark task to evaluate (default: cnndm)")
     parser.add_argument("--seed", type=int, default=2024, help="Random seed used in generation (default: 2024)")
     parser.add_argument("--data-num", type=int, default=10, help="Number of samples generated (default: 10)")
-    
+
     args = parser.parse_args()
-    evaluate_rouge(args.answer_file, args.seed, args.data_num)
+    evaluate_rouge(args.answer_file, args.task_name, args.seed, args.data_num)

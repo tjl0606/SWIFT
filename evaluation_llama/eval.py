@@ -43,6 +43,9 @@ def normalize_task_name(task_name):
         "natural_question": "natural_questions",
         "nq": "natural_questions",
         "nq_open": "natural_questions",
+        "sam_sum": "samsum",
+        "sam_sum_dialogue": "samsum",
+        "samsum_dialogue": "samsum",
     }
     return aliases.get(name, name)
 
@@ -272,6 +275,23 @@ def score_qa_prediction(prediction, gold_answers):
     return exact_match, f1
 
 
+def build_rouge_scorer():
+    from rouge_score import rouge_scorer
+
+    return rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+
+
+def score_rouge_prediction(scorer, prediction, reference):
+    prediction = str(prediction).replace("\n", " ")
+    reference = str(reference).replace("\n", " ")
+    scores = scorer.score(reference, prediction)
+    return {
+        "rouge1": scores["rouge1"].fmeasure,
+        "rouge2": scores["rouge2"].fmeasure,
+        "rougeL": scores["rougeL"].fmeasure,
+    }
+
+
 def extract_qa_gold_answers(example, task_name):
     task_name = normalize_task_name(task_name)
     gold_answers = []
@@ -328,6 +348,36 @@ def clip_input(
         prompt_text = prompt_shots + "Article: " + prompt["article"] + "\nSummary:"
         end_prompt = "\nSummary:"
         inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+
+    elif task_name == "samsum":
+        dialogue = prompt["dialogue"].strip()
+        if is_instruct and hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that summarizes conversations.",
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Summarize the following dialogue in one concise paragraph. "
+                        "Provide only the summary.\n\n"
+                        f"Dialogue:\n{dialogue}"
+                    ),
+                },
+            ]
+            formatted = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = tokenizer(formatted, return_tensors="pt").to(device)
+        else:
+            prompt_text = (
+                prompt_shots
+                + "Summarize the following dialogue in one concise paragraph.\n\n"
+                + f"Dialogue:\n{dialogue}\nSummary:"
+            )
+            end_prompt = "\nSummary:"
+            inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
 
     elif task_name == "humaneval":
         raw_prompt = prompt["prompt"]
@@ -458,6 +508,12 @@ def load_data(task_name, seed, data_num=10):
             )
             prompt_shots += prompt
 
+    elif task_name == "samsum":
+        dataset = load_dataset("knkarthick/samsum", split="test").shuffle(seed=seed)
+        if data_num is not None and data_num < len(dataset):
+            dataset = dataset.select(range(data_num))
+        data = dataset
+
     elif task_name == "humaneval":
         original_data = read_problems()
         for i, task_id in enumerate(original_data):
@@ -554,6 +610,7 @@ def get_model_answers(
     forward_kwargs = dict(kwargs)
     if generation_stop_config is not None:
         forward_kwargs["stop_config"] = generation_stop_config
+    rouge_metric_scorer = build_rouge_scorer() if task_name == "samsum" else None
 
     accept_lengths_tree = []
     total_draft_num = 0
@@ -562,6 +619,10 @@ def get_model_answers(
     total_qa_exact_match = 0.0
     total_qa_f1 = 0.0
     total_qa_scored = 0
+    total_rouge1 = 0.0
+    total_rouge2 = 0.0
+    total_rougeL = 0.0
+    total_rouge_scored = 0
 
     os.makedirs(os.path.dirname(answer_file), exist_ok=True)
     with open(os.path.expanduser(answer_file), "w", encoding="utf-8"):
@@ -685,6 +746,23 @@ def get_model_answers(
             total_qa_f1 += f1
             total_qa_scored += 1
 
+        elif task_name == "samsum":
+            rouge_scores = score_rouge_prediction(
+                rouge_metric_scorer,
+                output,
+                question["summary"],
+            )
+            sample_record["dialogue"] = question["dialogue"]
+            sample_record["gold_summary"] = question["summary"]
+            sample_record["rouge1"] = rouge_scores["rouge1"]
+            sample_record["rouge2"] = rouge_scores["rouge2"]
+            sample_record["rougeL"] = rouge_scores["rougeL"]
+
+            total_rouge1 += rouge_scores["rouge1"]
+            total_rouge2 += rouge_scores["rouge2"]
+            total_rougeL += rouge_scores["rougeL"]
+            total_rouge_scored += 1
+
         if sample_correct is not None:
             total_scored += 1
             total_correct += int(sample_correct)
@@ -737,6 +815,12 @@ def get_model_answers(
         summary["Exact Match"] = total_qa_exact_match / total_qa_scored
         summary["F1"] = total_qa_f1 / total_qa_scored
 
+    if total_rouge_scored > 0:
+        summary["ROUGE-1"] = total_rouge1 / total_rouge_scored
+        summary["ROUGE-2"] = total_rouge2 / total_rouge_scored
+        summary["ROUGE-L"] = total_rougeL / total_rouge_scored
+        summary["Total ROUGE Scored"] = total_rouge_scored
+
     with open(os.path.expanduser(answer_file), "a", encoding="utf-8") as fout:
         fout.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
@@ -750,3 +834,9 @@ def get_model_answers(
         print("Exact Match:", summary["Exact Match"])
     if "F1" in summary:
         print("F1:", summary["F1"])
+    if "ROUGE-1" in summary:
+        print("ROUGE-1:", summary["ROUGE-1"])
+    if "ROUGE-2" in summary:
+        print("ROUGE-2:", summary["ROUGE-2"])
+    if "ROUGE-L" in summary:
+        print("ROUGE-L:", summary["ROUGE-L"])
