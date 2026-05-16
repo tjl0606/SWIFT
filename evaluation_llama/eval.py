@@ -806,6 +806,36 @@ def get_model_answers(
         summary["Best Attn Layer Set"] = [int(x) for x in list(best_attn_skip_layer_id_set)]
         summary["Best MLP Layer Set"] = [int(x) for x in list(best_mlp_skip_layer_id_set)]
 
+    runtime_statistics = forward_kwargs.get("statistics")
+    if runtime_statistics and runtime_statistics.get("dynamic_retain_ratio"):
+        summary["Dynamic Retain Ratio"] = True
+        summary["Best Draft KV Retain Ratio"] = float(
+            runtime_statistics.get(
+                "best_retain_ratio",
+                runtime_statistics.get("draft_kv_retain_ratio", getattr(model, "draft_kv_retain_ratio", 1.0)),
+            )
+        )
+        if "best_retain_score" in runtime_statistics:
+            summary["Best Retain Matchness"] = float(runtime_statistics["best_retain_score"])
+        if "best_retain_utility" in runtime_statistics:
+            summary["Best Retain Utility"] = float(runtime_statistics["best_retain_utility"])
+        summary["Retain Utility Mode"] = runtime_statistics.get("retain_utility_mode", "relative")
+        summary["Retain Compression Weight"] = float(runtime_statistics.get("retain_compression_weight", 0.5))
+        summary["Retain Score Tolerance"] = float(runtime_statistics.get("retain_score_tolerance", 0.05))
+        summary["Retain Utility Lambda"] = float(runtime_statistics.get("retain_utility_lambda", 1.0))
+        summary["Retain UCB C"] = float(runtime_statistics.get("retain_ucb_c", 0.3))
+        summary["Retain Warmup Rounds"] = int(runtime_statistics.get("retain_warmup_rounds", 50))
+        summary["Retain Filter Top K"] = int(runtime_statistics.get("retain_filter_top_k", 3))
+        summary["Retain Refine Rounds"] = int(runtime_statistics.get("retain_refine_rounds", 100))
+        summary["Retain Final Tolerance"] = float(runtime_statistics.get("retain_final_tolerance", 0.05))
+        summary["Final Layer Refine Rounds"] = int(runtime_statistics.get("final_layer_refine_rounds", 100))
+        summary["Retain Stage"] = runtime_statistics.get("retain_stage")
+        summary["Retain Candidate Ratios"] = runtime_statistics.get("retain_candidate_ratios")
+        summary["Retain Final Ratio"] = runtime_statistics.get("retain_final_ratio")
+        summary["Retain Ratio Search State"] = runtime_statistics.get("retain_ratio_state", {})
+    elif hasattr(model, "draft_kv_retain_ratio"):
+        summary["Draft KV Retain Ratio"] = float(model.draft_kv_retain_ratio)
+
     if total_scored > 0:
         summary["Accuracy"] = total_correct / total_scored
         summary["Total Correct"] = total_correct
@@ -828,6 +858,10 @@ def get_model_answers(
         print("#Mean accepted tokens:", summary["Mean accepted tokens"])
     if "Token acceptance rate" in summary:
         print("Token acceptance rate:", summary["Token acceptance rate"])
+    if "Best Draft KV Retain Ratio" in summary:
+        print("Best Draft KV Retain Ratio:", summary["Best Draft KV Retain Ratio"])
+    elif "Draft KV Retain Ratio" in summary:
+        print("Draft KV Retain Ratio:", summary["Draft KV Retain Ratio"])
     if "Accuracy" in summary:
         print("Accuracy:", summary["Accuracy"])
     if "Exact Match" in summary:

@@ -24,6 +24,50 @@ def _cache_key_part(value):
     return str(value).replace("/", "_").replace(" ", "_")
 
 
+def parse_retain_ratio_grid(value, initial_ratio=None):
+    retain_ratios = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        retain_ratio = float(item)
+        if retain_ratio <= 0.0 or retain_ratio > 1.0:
+            raise ValueError("retain ratios must be in the range (0, 1].")
+        if not any(abs(retain_ratio - existing) < 1e-9 for existing in retain_ratios):
+            retain_ratios.append(retain_ratio)
+
+    if initial_ratio is not None and not any(abs(float(initial_ratio) - existing) < 1e-9 for existing in retain_ratios):
+        retain_ratios.insert(0, float(initial_ratio))
+
+    if not retain_ratios:
+        raise ValueError("retain ratio grid must contain at least one ratio.")
+
+    return retain_ratios
+
+
+def format_retain_ratio_grid(retain_ratios):
+    return ",".join(str(float(retain_ratio)) for retain_ratio in retain_ratios)
+
+
+def retain_ratio_run_name(args):
+    if args.dynamic_retain_ratio:
+        return "dynamic-2"
+    return str(args.draft_kv_retain_ratio)
+
+
+def build_layer_optimizer(num_hidden_layers, random_state=1):
+    pbounds = {f"x{i}": (0, 1) for i in range((num_hidden_layers - 2) * 2)}
+    optimizer = BayesianOptimization(
+        f=None,
+        pbounds=pbounds,
+        random_state=random_state,
+        verbose=1,
+        allow_duplicate_points=True,
+    )
+    optimizer.set_gp_params(alpha=1e-2)
+    return optimizer
+
+
 def build_skip_layer_cache_key(args):
     draft_token_num = args.draft_token_num if args.draft_token_num is not None else "auto"
     parts = [
@@ -45,6 +89,22 @@ def build_skip_layer_cache_key(args):
         f"draft-token-num-{draft_token_num}",
         f"opt-compressed-draft-kv-{args.optimize_with_compressed_draft_kv}",
     ]
+    if args.dynamic_retain_ratio:
+        parts.extend([
+            "dynamic-retain-ratio-True",
+            f"retain-ratio-grid-{args.retain_ratio_grid}",
+            f"retain-target-score-{args.retain_target_score}",
+            f"retain-utility-lambda-{args.retain_utility_lambda}",
+            f"retain-utility-mode-{args.retain_utility_mode}",
+            f"retain-compression-weight-{args.retain_compression_weight}",
+            f"retain-score-tolerance-{args.retain_score_tolerance}",
+            f"retain-ucb-c-{args.retain_ucb_c}",
+            f"retain-warmup-rounds-{args.retain_warmup_rounds}",
+            f"retain-filter-top-k-{args.retain_filter_top_k}",
+            f"retain-refine-rounds-{args.retain_refine_rounds}",
+            f"retain-final-tolerance-{args.retain_final_tolerance}",
+            f"final-layer-refine-rounds-{args.final_layer_refine_rounds}",
+        ])
     return "__".join(_cache_key_part(part) for part in parts)
 
 
@@ -488,6 +548,85 @@ if __name__ == "__main__":
         help="Retain ratio of KV cache during draft. 1.0 means no compression.",
     )
     parser.add_argument(
+        "--dynamic-retain-ratio",
+        action="store_true",
+        default=False,
+        help="Dynamically choose draft KV retain ratio jointly with the skip-layer pattern during inference.",
+    )
+    parser.add_argument(
+        "--retain-ratio-grid",
+        type=str,
+        default="1.0,0.9,0.8,0.7,0.6",
+        help="Comma-separated retain ratios to search when --dynamic-retain-ratio is enabled.",
+    )
+    parser.add_argument(
+        "--retain-target-score",
+        type=float,
+        default=None,
+        help="Matchness target for absolute dynamic retain-ratio utility. Defaults to --max-score.",
+    )
+    parser.add_argument(
+        "--retain-utility-mode",
+        type=str,
+        default="relative",
+        choices=["relative", "additive", "absolute"],
+        help="Utility used to compare dynamic retain-ratio candidates.",
+    )
+    parser.add_argument(
+        "--retain-compression-weight",
+        type=float,
+        default=0.5,
+        help="Weight for the compression-gain term in relative/additive dynamic retain-ratio utility.",
+    )
+    parser.add_argument(
+        "--retain-score-tolerance",
+        type=float,
+        default=0.05,
+        help="Allowed matchness drop from the best full-retain reference before applying relative utility penalty.",
+    )
+    parser.add_argument(
+        "--retain-utility-lambda",
+        type=float,
+        default=1.0,
+        help="Penalty applied to matchness deficit in dynamic retain-ratio utility.",
+    )
+    parser.add_argument(
+        "--retain-ucb-c",
+        type=float,
+        default=0.3,
+        help="UCB exploration weight for selecting retain ratios in dynamic mode.",
+    )
+    parser.add_argument(
+        "--retain-warmup-rounds",
+        type=int,
+        default=50,
+        help="Number of initial equal warmup probes to give each retain ratio.",
+    )
+    parser.add_argument(
+        "--retain-filter-top-k",
+        type=int,
+        default=3,
+        help="Number of retain ratios kept after equal warmup for candidate refinement.",
+    )
+    parser.add_argument(
+        "--retain-refine-rounds",
+        type=int,
+        default=100,
+        help="Number of refinement probes to give each retained candidate ratio.",
+    )
+    parser.add_argument(
+        "--retain-final-tolerance",
+        type=float,
+        default=0.05,
+        help="When choosing the final ratio, prefer the lowest retain ratio within this utility gap from the best.",
+    )
+    parser.add_argument(
+        "--final-layer-refine-rounds",
+        type=int,
+        default=100,
+        help="Number of layer-only refinement probes after the final retain ratio is selected.",
+    )
+    parser.add_argument(
         "--optimize-with-compressed-draft-kv",
         dest="optimize_with_compressed_draft_kv",
         action="store_true",
@@ -540,19 +679,62 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.draft_token_num is not None and args.draft_token_num <= 0:
         parser.error("--draft-token-num must be a positive integer.")
+    if args.draft_kv_retain_ratio <= 0.0 or args.draft_kv_retain_ratio > 1.0:
+        parser.error("--draft-kv-retain-ratio must be in the range (0, 1].")
+    if args.retain_warmup_rounds <= 0:
+        parser.error("--retain-warmup-rounds must be a positive integer.")
+    if args.retain_filter_top_k <= 0:
+        parser.error("--retain-filter-top-k must be a positive integer.")
+    if args.retain_refine_rounds < 0:
+        parser.error("--retain-refine-rounds must be non-negative.")
+    if args.retain_final_tolerance < 0.0:
+        parser.error("--retain-final-tolerance must be non-negative.")
+    if args.final_layer_refine_rounds < 0:
+        parser.error("--final-layer-refine-rounds must be non-negative.")
+    try:
+        args.retain_ratio_grid_values = parse_retain_ratio_grid(
+            args.retain_ratio_grid,
+            initial_ratio=args.draft_kv_retain_ratio if args.dynamic_retain_ratio else None,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.retain_ratio_grid = format_retain_ratio_grid(args.retain_ratio_grid_values)
+    if args.retain_target_score is None:
+        args.retain_target_score = args.max_score
+    if args.retain_target_score < 0.0 or args.retain_target_score > 1.0:
+        parser.error("--retain-target-score must be in the range [0, 1].")
+    if args.retain_utility_lambda < 0.0:
+        parser.error("--retain-utility-lambda must be non-negative.")
+    if args.retain_compression_weight < 0.0:
+        parser.error("--retain-compression-weight must be non-negative.")
+    if args.retain_score_tolerance < 0.0:
+        parser.error("--retain-score-tolerance must be non-negative.")
+    if args.retain_ucb_c < 0.0:
+        parser.error("--retain-ucb-c must be non-negative.")
+    if args.dynamic_retain_ratio and not args.optimization:
+        parser.error("--dynamic-retain-ratio requires --optimization.")
+    if args.dynamic_retain_ratio and args.draft_only:
+        parser.error("--dynamic-retain-ratio is not supported with --draft-only.")
+    if args.dynamic_retain_ratio and not args.draft_kv_compress:
+        parser.error("--dynamic-retain-ratio requires --draft-kv-compress.")
+    if args.dynamic_retain_ratio and not args.optimize_with_compressed_draft_kv:
+        parser.error("--dynamic-retain-ratio requires --optimize-with-compressed-draft-kv.")
+    if args.dynamic_retain_ratio and (args.load_skip_layer_cache or args.cache_hit):
+        parser.error("--dynamic-retain-ratio cannot be combined with cached skip-layer loading.")
     if args.save_skip_layer_cache and args.load_skip_layer_cache:
         parser.error("--save-skip-layer-cache and --load-skip-layer-cache are mutually exclusive.")
 
     args.skip_layer_cache_key = args.skip_layer_cache_key or build_skip_layer_cache_key(args)
 
+    retain_ratio_name = retain_ratio_run_name(args)
     args.model_name = (args.model_id + "-swift-" + str(args.dtype)+ "-temp-" + str(args.temperature)
                        + "-top-p-" + str(args.top_p) + "-seed-" + str(args.seed) + "-max_new_tokens-" + str(args.max_new_tokens)+ "-opt_interval-" + str(args.opt_interval)
                     #    + "-bayes_interval-" + str(args.bayes_interval) + "-max_opt-" + str(args.max_opt_iter) + "-max_tolerance-" + str(args.max_tolerance_iter)
-                       + "-max_score-" + str(args.max_score) + "-context_window-" + str(args.context_window) + "-skip_ratio-" + str(args.skip_ratio) + "-draft_kv_retain_ratio-" + str(args.draft_kv_retain_ratio)
+                       + "-max_score-" + str(args.max_score) + "-context_window-" + str(args.context_window) + "-skip_ratio-" + str(args.skip_ratio) + "-draft_kv_retain_ratio-" + retain_ratio_name
                        + "-opt_compressed_draft_kv-" + str(args.optimize_with_compressed_draft_kv)
                        + ("-draft_token_num-" + str(args.draft_token_num) if args.draft_token_num is not None else "")
                        + ("-draft_only" if args.draft_only else ""))
-    answer_file = f"outputs/{args.task_name}/{args.task_name}_{args.data_num}/without_layerskip_draft_model_answer/{args.model_id}/{args.model_name}.jsonl"
+    answer_file = args.answer_file or f"outputs/{args.task_name}/{args.task_name}_{args.data_num}/without_layerskip_draft_model_answer/{args.model_id}/{args.model_name}.jsonl"
     set_logger()
 
     print(f"Output to {answer_file}")
@@ -599,9 +781,13 @@ if __name__ == "__main__":
     model.set_skip_layers(_attn_skip_layer_id_set, _mlp_skip_layer_id_set)
 
     # Bayes Optimization Settings
-    pbounds = {f"x{i}": (0, 1) for i in range((model.config.num_hidden_layers - 2) * 2)} # keep the first and last layer
-    optimizer = BayesianOptimization(f=None, pbounds=pbounds, random_state=1, verbose=1, allow_duplicate_points=True)
-    optimizer.set_gp_params(alpha=1e-2)
+    if args.dynamic_retain_ratio:
+        optimizer = {
+            retain_ratio: build_layer_optimizer(model.config.num_hidden_layers, random_state=idx + 1)
+            for idx, retain_ratio in enumerate(args.retain_ratio_grid_values)
+        }
+    else:
+        optimizer = build_layer_optimizer(model.config.num_hidden_layers, random_state=1)
     utility = UtilityFunction(kind="ucb", kappa=2.5, xi=0.0)
 
     statistics = {"origin_score": 0, "opt_iter": 0, "tolerance_iter": 0,
@@ -611,7 +797,20 @@ if __name__ == "__main__":
                   "context_window": args.context_window, "optimization": args.optimization, "bayes": args.bayes,
                   "draft_kv_compress": args.draft_kv_compress, "draft_kv_retain_ratio": args.draft_kv_retain_ratio,
                   "optimize_with_compressed_draft_kv": args.optimize_with_compressed_draft_kv,
-                  "draft_token_num": args.draft_token_num}
+                  "draft_token_num": args.draft_token_num,
+                  "dynamic_retain_ratio": args.dynamic_retain_ratio,
+                  "retain_ratio_grid": args.retain_ratio_grid_values,
+                  "retain_target_score": args.retain_target_score,
+                  "retain_utility_mode": args.retain_utility_mode,
+                  "retain_compression_weight": args.retain_compression_weight,
+                  "retain_score_tolerance": args.retain_score_tolerance,
+                  "retain_utility_lambda": args.retain_utility_lambda,
+                  "retain_ucb_c": args.retain_ucb_c,
+                  "retain_warmup_rounds": args.retain_warmup_rounds,
+                  "retain_filter_top_k": args.retain_filter_top_k,
+                  "retain_refine_rounds": args.retain_refine_rounds,
+                  "retain_final_tolerance": args.retain_final_tolerance,
+                  "final_layer_refine_rounds": args.final_layer_refine_rounds}
 
     forward_f = draft_only_forward if args.draft_only else swift_forward
     run_eval(
@@ -656,7 +855,27 @@ if __name__ == "__main__":
                 "context_window": args.context_window,
                 "skip_ratio": args.skip_ratio,
                 "draft_token_num": args.draft_token_num,
-                "draft_kv_retain_ratio": args.draft_kv_retain_ratio,
+                "draft_kv_retain_ratio": statistics.get("draft_kv_retain_ratio", args.draft_kv_retain_ratio),
+                "dynamic_retain_ratio": args.dynamic_retain_ratio,
+                "retain_ratio_grid": args.retain_ratio_grid_values,
+                "retain_target_score": args.retain_target_score,
+                "retain_utility_mode": args.retain_utility_mode,
+                "retain_compression_weight": args.retain_compression_weight,
+                "retain_score_tolerance": args.retain_score_tolerance,
+                "retain_utility_lambda": args.retain_utility_lambda,
+                "retain_ucb_c": args.retain_ucb_c,
+                "retain_warmup_rounds": args.retain_warmup_rounds,
+                "retain_filter_top_k": args.retain_filter_top_k,
+                "retain_refine_rounds": args.retain_refine_rounds,
+                "retain_final_tolerance": args.retain_final_tolerance,
+                "final_layer_refine_rounds": args.final_layer_refine_rounds,
+                "retain_stage": statistics.get("retain_stage"),
+                "retain_candidate_ratios": statistics.get("retain_candidate_ratios"),
+                "retain_final_ratio": statistics.get("retain_final_ratio"),
+                "retain_ratio_state": statistics.get("retain_ratio_state", {}),
+                "best_retain_ratio": statistics.get("best_retain_ratio"),
+                "best_retain_score": statistics.get("best_retain_score"),
+                "best_retain_utility": statistics.get("best_retain_utility"),
                 "optimize_with_compressed_draft_kv": args.optimize_with_compressed_draft_kv,
                 "origin_score": statistics["origin_score"],
                 "opt_iter": statistics["opt_iter"],

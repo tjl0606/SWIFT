@@ -19,11 +19,24 @@ MAX_SCORE=${MAX_SCORE:-0.93}
 BASE_CONTEXT_WINDOW=${BASE_CONTEXT_WINDOW:-50}
 CONTEXT_WINDOW=${BASE_CONTEXT_WINDOW}
 SKIP_RATIO=${SKIP_RATIO:-0.45}
-DRAFT_TOKEN_NUM=${DRAFT_TOKEN_NUM-3} # e.g. 8; leave empty to use stop_threshold
-OPTIMIZE_WITH_COMPRESSED_DRAFT_KV=${OPTIMIZE_WITH_COMPRESSED_DRAFT_KV:-0} # 1: optimize layer skips with compressed KV, 0: use uncompressed KV
+DRAFT_TOKEN_NUM=${DRAFT_TOKEN_NUM-} # e.g. 8; leave empty to use stop_threshold
+OPTIMIZE_WITH_COMPRESSED_DRAFT_KV=${OPTIMIZE_WITH_COMPRESSED_DRAFT_KV:-1} # 1: optimize layer skips with compressed KV, 0: use uncompressed KV
+DYNAMIC_RETAIN_RATIO=${DYNAMIC_RETAIN_RATIO:-1}
+RETAIN_RATIO=${RETAIN_RATIO:-1.0}
+RETAIN_RATIO_GRID=${RETAIN_RATIO_GRID:-1.0,0.9,0.8,0.7,0.6}
+RETAIN_UTILITY_MODE=${RETAIN_UTILITY_MODE:-relative}
+RETAIN_COMPRESSION_WEIGHT=${RETAIN_COMPRESSION_WEIGHT:-0.5}
+RETAIN_SCORE_TOLERANCE=${RETAIN_SCORE_TOLERANCE:-0.05}
+RETAIN_UTILITY_LAMBDA=${RETAIN_UTILITY_LAMBDA:-1.0}
+RETAIN_UCB_C=${RETAIN_UCB_C:-0.3}
+RETAIN_WARMUP_ROUNDS=${RETAIN_WARMUP_ROUNDS:-50}
+RETAIN_FILTER_TOP_K=${RETAIN_FILTER_TOP_K:-3}
+RETAIN_REFINE_ROUNDS=${RETAIN_REFINE_ROUNDS:-100}
+RETAIN_FINAL_TOLERANCE=${RETAIN_FINAL_TOLERANCE:-0.05}
+FINAL_LAYER_REFINE_ROUNDS=${FINAL_LAYER_REFINE_ROUNDS:-500}
 
-TASK_NAME=${TASK_NAME:-samsum} # gsm8k, mmlu, triviaqa, natural_questions, cnndm, humaneval, samsum
-DATA_NUM=${DATA_NUM:-100}
+TASK_NAME=${TASK_NAME:-gsm8k} # gsm8k, mmlu, triviaqa, natural_questions, cnndm, humaneval, samsum
+DATA_NUM=${DATA_NUM:-1000}
 TOP_P=${TOP_P:-1.0}
 
 torch_dtype=${torch_dtype:-bfloat16} # ["float32", "float64", "float16", "bfloat16"]
@@ -61,11 +74,24 @@ DRAFT_TOKEN_ARG=""
 if [ -n "${DRAFT_TOKEN_NUM}" ]; then
   DRAFT_TOKEN_ARG="--draft-token-num ${DRAFT_TOKEN_NUM}"
 fi
+
+if [ "${DYNAMIC_RETAIN_RATIO}" = "1" ]; then
+  OPTIMIZE_WITH_COMPRESSED_DRAFT_KV=1
+  if [[ ",${RETAIN_RATIO_GRID}," != *",${RETAIN_RATIO},"* ]]; then
+    RETAIN_RATIO_GRID="${RETAIN_RATIO},${RETAIN_RATIO_GRID}"
+  fi
+fi
+
 OPTIMIZATION_KV_ARG="--optimize-with-compressed-draft-kv"
 OPTIMIZATION_KV_NAME="True"
 if [ "${OPTIMIZE_WITH_COMPRESSED_DRAFT_KV}" = "0" ]; then
   OPTIMIZATION_KV_ARG="--no-optimize-with-compressed-draft-kv"
   OPTIMIZATION_KV_NAME="False"
+fi
+
+DYNAMIC_RETAIN_ARG=""
+if [ "${DYNAMIC_RETAIN_RATIO}" = "1" ]; then
+  DYNAMIC_RETAIN_ARG="--dynamic-retain-ratio --retain-ratio-grid ${RETAIN_RATIO_GRID} --retain-target-score ${MAX_SCORE} --retain-utility-mode ${RETAIN_UTILITY_MODE} --retain-compression-weight ${RETAIN_COMPRESSION_WEIGHT} --retain-score-tolerance ${RETAIN_SCORE_TOLERANCE} --retain-utility-lambda ${RETAIN_UTILITY_LAMBDA} --retain-ucb-c ${RETAIN_UCB_C} --retain-warmup-rounds ${RETAIN_WARMUP_ROUNDS} --retain-filter-top-k ${RETAIN_FILTER_TOP_K} --retain-refine-rounds ${RETAIN_REFINE_ROUNDS} --retain-final-tolerance ${RETAIN_FINAL_TOLERANCE} --final-layer-refine-rounds ${FINAL_LAYER_REFINE_ROUNDS}"
 fi
 
 SKIP_LAYER_CACHE_FILE="outputs/skip_layer_cache.json"
@@ -83,12 +109,17 @@ baseline_answer_file() {
 
 swift_answer_file() {
   RETAIN_RATIO_ARG=$1
+  RETAIN_RATIO_NAME=${RETAIN_RATIO_ARG}
+  if [ "${DYNAMIC_RETAIN_RATIO}" = "1" ]; then
+    RETAIN_RATIO_NAME="dynamic-2"
+  fi
+
   DRAFT_TOKEN_SUFFIX=""
   if [ -n "${DRAFT_TOKEN_NUM}" ]; then
     DRAFT_TOKEN_SUFFIX="-draft_token_num-${DRAFT_TOKEN_NUM}"
   fi
 
-  MODEL_RUN_NAME="${MODEL_NAME}-swift-${torch_dtype}-temp-${TEMP}-top-p-${TOP_P}-seed-${SEED}-max_new_tokens-${MAX_NEW_TOKENS}-opt_interval-${OPT_INTERVAL}-max_score-${MAX_SCORE}-context_window-${CONTEXT_WINDOW}-skip_ratio-${SKIP_RATIO}-draft_kv_retain_ratio-${RETAIN_RATIO_ARG}-opt_compressed_draft_kv-${OPTIMIZATION_KV_NAME}${DRAFT_TOKEN_SUFFIX}"
+  MODEL_RUN_NAME="${MODEL_NAME}-swift-${torch_dtype}-temp-${TEMP}-top-p-${TOP_P}-seed-${SEED}-max_new_tokens-${MAX_NEW_TOKENS}-opt_interval-${OPT_INTERVAL}-max_score-${MAX_SCORE}-context_window-${CONTEXT_WINDOW}-skip_ratio-${SKIP_RATIO}-draft_kv_retain_ratio-${RETAIN_RATIO_NAME}-opt_compressed_draft_kv-${OPTIMIZATION_KV_NAME}${DRAFT_TOKEN_SUFFIX}"
   echo "outputs/${TASK_NAME}/${TASK_NAME}_${DATA_NUM}/without_layerskip_draft_model_answer/${MODEL_NAME}/${MODEL_RUN_NAME}.jsonl"
 }
 
@@ -113,19 +144,25 @@ run_swift_eval() {
   RETAIN_RATIO_ARG=$1
   CACHE_ARG=$2
   DO_QUALITY_EVAL=${3:-1}
+  ANSWER_FILE=$(swift_answer_file ${RETAIN_RATIO_ARG})
 
   CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation_llama.inference_swift --model-path $MODEL_PATH --model-id ${MODEL_NAME} \
+    --answer-file "${ANSWER_FILE}" \
     --temperature $TEMP --top-p ${TOP_P} --dtype $torch_dtype --task-name ${TASK_NAME} --data-num ${DATA_NUM} --max-new-tokens ${MAX_NEW_TOKENS} \
     --seed $SEED --context-window ${CONTEXT_WINDOW} --opt-interval ${OPT_INTERVAL} --bayes-interval ${BAYES_INTERVAL} --max-opt-iter ${MAX_OPT_ITER} \
-    --max-tolerance-iter ${MAX_TOLERANCE_ITER} --max-score ${MAX_SCORE} --skip-ratio ${SKIP_RATIO} ${DRAFT_TOKEN_ARG} ${OPTIMIZATION_KV_ARG} ${CACHE_ARG} \
+    --max-tolerance-iter ${MAX_TOLERANCE_ITER} --max-score ${MAX_SCORE} --skip-ratio ${SKIP_RATIO} ${DRAFT_TOKEN_ARG} ${OPTIMIZATION_KV_ARG} ${DYNAMIC_RETAIN_ARG} ${CACHE_ARG} \
     --optimization --bayes --draft-kv-compress --draft-kv-retain-ratio ${RETAIN_RATIO_ARG}
 
   if [ "${DO_QUALITY_EVAL}" = "1" ]; then
-    run_quality_eval "$(swift_answer_file ${RETAIN_RATIO_ARG})"
+    run_quality_eval "${ANSWER_FILE}"
   fi
 }
 
 run_skip_layer_calibration() {
+  if [ "${DYNAMIC_RETAIN_RATIO}" = "1" ]; then
+    return 0
+  fi
+
   if [ "${OPTIMIZE_WITH_COMPRESSED_DRAFT_KV}" = "0" ]; then
     echo "Calibrating shared skip layers for ${TASK_NAME} with uncompressed optimization KV..."
     run_swift_eval 1.0 "${SAVE_SKIP_LAYER_CACHE_ARG}" 0
@@ -134,6 +171,11 @@ run_skip_layer_calibration() {
 
 run_swift_benchmark() {
   run_skip_layer_calibration
+  if [ "${DYNAMIC_RETAIN_RATIO}" = "1" ]; then
+    run_swift_eval ${RETAIN_RATIO} ""
+    return 0
+  fi
+
   for RETAIN_RATIO in 1.0 0.99 0.9 0.8 0.7 0.6; do
     run_swift_eval ${RETAIN_RATIO} "${LOAD_SKIP_LAYER_CACHE_ARG}"
   done
@@ -141,5 +183,5 @@ run_swift_benchmark() {
 
 set_task_generation_params
 echo "Running ${TASK_NAME} with MAX_NEW_TOKENS=${MAX_NEW_TOKENS}, DATA_NUM=${DATA_NUM}, CONTEXT_WINDOW=${CONTEXT_WINDOW}"
-run_baseline_eval
+# run_baseline_eval
 run_swift_benchmark

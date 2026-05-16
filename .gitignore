@@ -1,0 +1,8 @@
+# Ignore JSON Lines files
+*.jsonl
+
+# Ignore Python compiled files
+*.pyc
+
+# Optional: ignore Python cache directories
+__pycache__/

@@ -1,4 +1,5 @@
 import copy
+import math
 import os.path
 import random
 import json
@@ -917,6 +918,250 @@ def layer_random_search(num_skip_layers=34, num_hidden_layers=40):
     return attn_skip_layers, mlp_skip_layers
 
 
+def _retain_ratio_key(retain_ratio):
+    return str(float(retain_ratio))
+
+
+def _ensure_dynamic_retain_state(statistics):
+    retain_ratio_grid = statistics.get("retain_ratio_grid", [statistics.get("draft_kv_retain_ratio", 1.0)])
+    retain_ratio_state = statistics.setdefault("retain_ratio_state", {})
+    for retain_ratio in retain_ratio_grid:
+        key = _retain_ratio_key(retain_ratio)
+        retain_ratio_state.setdefault(
+            key,
+            {
+                "trials": 0,
+                "score_sum": 0.0,
+                "utility_sum": 0.0,
+                "best_score": 0.0,
+                "best_utility": -1e30,
+                "best_attention": [],
+                "best_mlp": [],
+            },
+        )
+    statistics.setdefault("origin_utility", float("-inf"))
+    return retain_ratio_state
+
+
+def _select_dynamic_retain_ratio(statistics, model=None):
+    retain_ratio_grid = statistics.get("retain_ratio_grid", [statistics.get("draft_kv_retain_ratio", 1.0)])
+    retain_ratio_state = _ensure_dynamic_retain_state(statistics)
+    statistics.setdefault("retain_stage", "warmup")
+
+    while True:
+        retain_stage = statistics.get("retain_stage", "warmup")
+        if retain_stage == "warmup":
+            warmup_rounds = int(statistics.get("retain_warmup_rounds", 1))
+            under_warmup = [
+                retain_ratio
+                for retain_ratio in retain_ratio_grid
+                if retain_ratio_state[_retain_ratio_key(retain_ratio)]["trials"] < warmup_rounds
+            ]
+            if under_warmup:
+                return min(
+                    under_warmup,
+                    key=lambda retain_ratio: retain_ratio_state[_retain_ratio_key(retain_ratio)]["trials"],
+                )
+
+            _start_dynamic_retain_candidate_refine(statistics)
+            continue
+
+        if retain_stage == "candidate_refine":
+            candidate_ratios = statistics.get("retain_candidate_ratios", retain_ratio_grid)
+            refine_start_trials = statistics.get("retain_refine_start_trials", {})
+            refine_rounds = int(statistics.get("retain_refine_rounds", 0))
+            under_refine = [
+                retain_ratio
+                for retain_ratio in candidate_ratios
+                if (
+                    retain_ratio_state[_retain_ratio_key(retain_ratio)]["trials"]
+                    - int(refine_start_trials.get(_retain_ratio_key(retain_ratio), 0))
+                ) < refine_rounds
+            ]
+            if under_refine:
+                return min(
+                    under_refine,
+                    key=lambda retain_ratio: (
+                        retain_ratio_state[_retain_ratio_key(retain_ratio)]["trials"]
+                        - int(refine_start_trials.get(_retain_ratio_key(retain_ratio), 0))
+                    ),
+                )
+
+            _start_dynamic_retain_final_refine(statistics, model=model)
+            continue
+
+        if retain_stage == "final_refine":
+            return statistics.get("retain_final_ratio", statistics.get("draft_kv_retain_ratio", retain_ratio_grid[0]))
+
+        return statistics.get("retain_final_ratio", statistics.get("draft_kv_retain_ratio", retain_ratio_grid[0]))
+
+
+def _rank_dynamic_retain_ratios(statistics, ratios=None):
+    retain_ratio_grid = ratios or statistics.get("retain_ratio_grid", [statistics.get("draft_kv_retain_ratio", 1.0)])
+    retain_ratio_state = _ensure_dynamic_retain_state(statistics)
+    return sorted(
+        retain_ratio_grid,
+        key=lambda retain_ratio: (
+            -float(retain_ratio_state[_retain_ratio_key(retain_ratio)].get("best_utility", -1e30)),
+            float(retain_ratio),
+        ),
+    )
+
+
+def _start_dynamic_retain_candidate_refine(statistics):
+    retain_ratio_grid = statistics.get("retain_ratio_grid", [statistics.get("draft_kv_retain_ratio", 1.0)])
+    retain_ratio_state = _ensure_dynamic_retain_state(statistics)
+    top_k = max(1, int(statistics.get("retain_filter_top_k", 3)))
+    candidate_ratios = _rank_dynamic_retain_ratios(statistics, retain_ratio_grid)[:min(top_k, len(retain_ratio_grid))]
+
+    statistics["retain_candidate_ratios"] = [float(retain_ratio) for retain_ratio in candidate_ratios]
+    statistics["retain_refine_start_trials"] = {
+        _retain_ratio_key(retain_ratio): int(retain_ratio_state[_retain_ratio_key(retain_ratio)]["trials"])
+        for retain_ratio in candidate_ratios
+    }
+    statistics["retain_stage"] = "candidate_refine"
+    logging.info("Dynamic retain Stage 2 candidates: {}".format(statistics["retain_candidate_ratios"]))
+
+
+def _start_dynamic_retain_final_refine(statistics, model=None):
+    retain_ratio_state = _ensure_dynamic_retain_state(statistics)
+    candidate_ratios = statistics.get("retain_candidate_ratios")
+    if not candidate_ratios:
+        candidate_ratios = statistics.get("retain_ratio_grid", [statistics.get("draft_kv_retain_ratio", 1.0)])
+
+    best_utility = max(
+        float(retain_ratio_state[_retain_ratio_key(retain_ratio)].get("best_utility", -1e30))
+        for retain_ratio in candidate_ratios
+    )
+    final_tolerance = float(statistics.get("retain_final_tolerance", 0.05))
+    eligible_ratios = [
+        retain_ratio
+        for retain_ratio in candidate_ratios
+        if best_utility - float(retain_ratio_state[_retain_ratio_key(retain_ratio)].get("best_utility", -1e30))
+        <= final_tolerance
+    ]
+    final_ratio = min(eligible_ratios)
+
+    statistics["retain_final_ratio"] = float(final_ratio)
+    statistics["retain_final_start_trials"] = int(retain_ratio_state[_retain_ratio_key(final_ratio)]["trials"])
+    statistics["retain_stage"] = "final_refine"
+    _set_dynamic_retain_best(statistics, final_ratio, model=model)
+    logging.info("Dynamic retain Stage 3 final ratio: {}".format(final_ratio))
+
+
+def _set_dynamic_retain_best(statistics, retain_ratio, model=None):
+    retain_ratio_state = _ensure_dynamic_retain_state(statistics)
+    state = retain_ratio_state[_retain_ratio_key(retain_ratio)]
+    statistics["draft_kv_retain_ratio"] = float(retain_ratio)
+    statistics["best_retain_ratio"] = float(retain_ratio)
+    statistics["best_retain_score"] = float(state.get("best_score", 0.0))
+    statistics["best_retain_utility"] = float(state.get("best_utility", -1e30))
+    statistics["origin_score"] = float(state.get("best_score", 0.0))
+    statistics["origin_utility"] = float(state.get("best_utility", -1e30))
+
+    if model is not None:
+        model.draft_kv_retain_ratio = float(retain_ratio)
+        if state.get("best_attention") or state.get("best_mlp"):
+            model.set_skip_layers(state.get("best_attention", []), state.get("best_mlp", []))
+
+
+def _maybe_finish_dynamic_retain(statistics):
+    if statistics.get("retain_stage") != "final_refine":
+        return
+
+    retain_ratio_state = _ensure_dynamic_retain_state(statistics)
+    final_ratio = statistics.get("retain_final_ratio")
+    if final_ratio is None:
+        return
+
+    final_rounds = int(statistics.get("final_layer_refine_rounds", 0))
+    final_done = (
+        retain_ratio_state[_retain_ratio_key(final_ratio)]["trials"]
+        - int(statistics.get("retain_final_start_trials", 0))
+    )
+    if final_done >= final_rounds:
+        statistics["retain_stage"] = "done"
+        statistics["optimization"] = False
+        logging.info("Dynamic retain search finished after final layer refinement.")
+
+
+def _dynamic_retain_utility(score, retain_ratio, statistics):
+    utility_mode = statistics.get("retain_utility_mode", "relative")
+    target_score = float(statistics.get("retain_target_score", statistics.get("max_score", 0.93)))
+    penalty = float(statistics.get("retain_utility_lambda", 1.0))
+    compression_weight = float(statistics.get("retain_compression_weight", 0.5))
+    score_tolerance = float(statistics.get("retain_score_tolerance", 0.05))
+    compression_gain = max(0.0, 1.0 - float(retain_ratio))
+
+    if utility_mode == "absolute":
+        if score >= target_score:
+            return compression_gain + 0.01 * (score - target_score)
+        return -penalty * (target_score - score)
+
+    if utility_mode == "additive":
+        return score + compression_weight * compression_gain
+
+    reference_score = _dynamic_retain_reference_score(statistics)
+    score_deficit = max(0.0, reference_score - float(score) - score_tolerance)
+    return float(score) + compression_weight * compression_gain - penalty * score_deficit
+
+
+def _dynamic_retain_reference_score(statistics):
+    retain_ratio_grid = statistics.get("retain_ratio_grid", [statistics.get("draft_kv_retain_ratio", 1.0)])
+    retain_ratio_state = _ensure_dynamic_retain_state(statistics)
+    baseline_ratio = max(retain_ratio_grid)
+    baseline_state = retain_ratio_state.get(_retain_ratio_key(baseline_ratio))
+    if baseline_state and baseline_state["trials"] > 0:
+        return float(baseline_state["best_score"])
+
+    best_scores = [
+        float(state["best_score"])
+        for state in retain_ratio_state.values()
+        if state["trials"] > 0
+    ]
+    if best_scores:
+        return max(best_scores)
+    return 0.0
+
+
+def _record_dynamic_retain_candidate(statistics, retain_ratio, score, candidate_utility,
+                                     attn_skip_layers, mlp_skip_layers):
+    retain_ratio_state = _ensure_dynamic_retain_state(statistics)
+    state = retain_ratio_state[_retain_ratio_key(retain_ratio)]
+    state["trials"] += 1
+    state["score_sum"] += float(score)
+    state["utility_sum"] += float(candidate_utility)
+    if candidate_utility > state["best_utility"]:
+        state["best_score"] = float(score)
+        state["best_utility"] = float(candidate_utility)
+        state["best_attention"] = _skip_layer_list(attn_skip_layers)
+        state["best_mlp"] = _skip_layer_list(mlp_skip_layers)
+
+
+def _get_retain_ratio_optimizer(optimizer, retain_ratio):
+    if not isinstance(optimizer, dict):
+        return optimizer
+    if retain_ratio in optimizer:
+        return optimizer[retain_ratio]
+    for key, value in optimizer.items():
+        if abs(float(key) - float(retain_ratio)) < 1e-9:
+            return value
+    return None
+
+
+def _optimizer_observation_count(optimizer):
+    if optimizer is None:
+        return 0
+    if hasattr(optimizer, "res"):
+        return len(optimizer.res)
+    if hasattr(optimizer, "space"):
+        try:
+            return len(optimizer.space)
+        except TypeError:
+            return 0
+    return 0
+
+
 def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_data,
             input_current_length_data, new_token_num, statistics, optimizer=None, utility=None, position_ids=None):
     """
@@ -929,10 +1174,20 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
         cur_past_key_values_data.append(input_past_key_values_data[i].clone())
     cur_current_length_data = input_current_length_data.clone()
 
+    dynamic_retain_ratio = statistics.get("dynamic_retain_ratio", False)
+    candidate_retain_ratio = statistics.get("draft_kv_retain_ratio", 1.0)
+    candidate_optimizer = optimizer
+    candidate_ratio_trials = statistics["opt_iter"]
+    if dynamic_retain_ratio:
+        candidate_retain_ratio = _select_dynamic_retain_ratio(statistics, model=model)
+        candidate_optimizer = _get_retain_ratio_optimizer(optimizer, candidate_retain_ratio)
+        candidate_ratio_state = _ensure_dynamic_retain_state(statistics)[_retain_ratio_key(candidate_retain_ratio)]
+        candidate_ratio_trials = candidate_ratio_state["trials"]
+
     use_compressed_optimization_kv = (
         statistics.get("optimize_with_compressed_draft_kv", True)
         and statistics.get("draft_kv_compress", False)
-        and statistics.get("draft_kv_retain_ratio", 1.0) < 0.9999
+        and candidate_retain_ratio < 0.9999
     )
 
     if use_compressed_optimization_kv:
@@ -941,7 +1196,7 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
             full_input_ids=full_input_ids,
             past_key_values_data=cur_past_key_values_data,
             current_length_data=cur_current_length_data,
-            retain_ratio=statistics["draft_kv_retain_ratio"],
+            retain_ratio=candidate_retain_ratio,
         )
     else:
         input_past_key_values = clone_past_key_values(model, cur_past_key_values_data, cur_current_length_data)
@@ -949,10 +1204,12 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
     origin_attn_skip_layer_id_set, origin_mlp_skip_layer_id_set = model.get_skip_layers()
     skip_layer_num = int((model.config.num_hidden_layers - 2) * 2 * statistics["skip_ratio"])
 
-    if (statistics["opt_iter"] + 1) % statistics["bayes_interval"] == 0 and statistics["bayes"]:
+    if ((candidate_ratio_trials + 1) % statistics["bayes_interval"] == 0
+            and statistics["bayes"]
+            and _optimizer_observation_count(candidate_optimizer) > 0):
         logging.info("*" * 30 + "Bayes Search!" + "*" * 30)
         next_point_to_probe, _attn_skip_layer_id_set, _mlp_skip_layer_id_set = layer_bayes_search(
-            optimizer, utility, num_skip_layers=skip_layer_num, num_hidden_layers=model.config.num_hidden_layers)
+            candidate_optimizer, utility, num_skip_layers=skip_layer_num, num_hidden_layers=model.config.num_hidden_layers)
     else:
         _attn_skip_layer_id_set, _mlp_skip_layer_id_set = layer_random_search(
             num_skip_layers=skip_layer_num, num_hidden_layers=model.config.num_hidden_layers)
@@ -993,11 +1250,42 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
     ).sum(-1).item()
     drafted_token_num = generate_ids[:, 1:step_end].size(-1)
     score = verified_token_num / drafted_token_num
-    logging.info('opt_iter {}, matchness {:.4f}'.format(statistics["opt_iter"], score))
+    logging.info('opt_iter {}, retain_ratio {:.4f}, matchness {:.4f}'.format(
+        statistics["opt_iter"], candidate_retain_ratio, score
+    ))
 
-    optimizer.register(params=next_point_to_probe, target=score)
+    if candidate_optimizer is not None:
+        candidate_optimizer.register(params=next_point_to_probe, target=score)
 
-    if score > statistics["origin_score"]:
+    if dynamic_retain_ratio:
+        candidate_utility = _dynamic_retain_utility(score, candidate_retain_ratio, statistics)
+        _record_dynamic_retain_candidate(
+            statistics,
+            candidate_retain_ratio,
+            score,
+            candidate_utility,
+            _attn_skip_layer_id_set,
+            _mlp_skip_layer_id_set,
+        )
+        logging.info('retain utility {:.4f} for ratio {:.4f}'.format(candidate_utility, candidate_retain_ratio))
+
+        if candidate_utility > statistics.get("origin_utility", float("-inf")):
+            logging.info("=" * 30 + 'utility changed from {:.4f} to {:.4f}'.format(
+                statistics.get("origin_utility", float("-inf")), candidate_utility
+            ) + "=" * 30)
+            statistics["origin_utility"] = candidate_utility
+            statistics["origin_score"] = score
+            statistics["draft_kv_retain_ratio"] = candidate_retain_ratio
+            statistics["best_retain_ratio"] = candidate_retain_ratio
+            statistics["best_retain_score"] = score
+            statistics["best_retain_utility"] = candidate_utility
+            model.draft_kv_retain_ratio = candidate_retain_ratio
+            statistics["tolerance_iter"] = 0
+        else:
+            model.set_skip_layers(origin_attn_skip_layer_id_set, origin_mlp_skip_layer_id_set)
+            model.draft_kv_retain_ratio = statistics.get("draft_kv_retain_ratio", 1.0)
+            statistics["tolerance_iter"] += 1
+    elif score > statistics["origin_score"]:
         logging.info("=" * 30 + 'matchness changed from {:.4f} to {:.4f}'.format(
             statistics["origin_score"], score
         ) + "=" * 30)
@@ -1012,7 +1300,10 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
 
     statistics["opt_iter"] += 1
 
-    if statistics["tolerance_iter"] > statistics["max_tolerance_iter"]:
+    if dynamic_retain_ratio:
+        _maybe_finish_dynamic_retain(statistics)
+
+    if (not dynamic_retain_ratio) and statistics["tolerance_iter"] > statistics["max_tolerance_iter"]:
         statistics["optimization"] = False
         logging.info("=" * 30 + 'Optimization Stopped because the optimization iter reaches the max tolerance!' + "=" * 30)
     if statistics["opt_iter"] > statistics["max_opt_iter"]:
