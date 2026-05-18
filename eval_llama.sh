@@ -13,7 +13,7 @@ GPU_DEVICES=${GPU_DEVICES:-0}
 # SWIFT Hyperparameters
 OPT_INTERVAL=${OPT_INTERVAL:-1}
 BAYES_INTERVAL=${BAYES_INTERVAL:-25}
-MAX_OPT_ITER=${MAX_OPT_ITER:-1000}
+MAX_OPT_ITER=${MAX_OPT_ITER:-1100}
 MAX_TOLERANCE_ITER=${MAX_TOLERANCE_ITER:-300}
 MAX_SCORE=${MAX_SCORE:-0.93}
 BASE_CONTEXT_WINDOW=${BASE_CONTEXT_WINDOW:-50}
@@ -22,6 +22,18 @@ SKIP_RATIO=${SKIP_RATIO:-0.45}
 DRAFT_TOKEN_NUM=${DRAFT_TOKEN_NUM-} # e.g. 8; leave empty to use stop_threshold
 OPTIMIZE_WITH_COMPRESSED_DRAFT_KV=${OPTIMIZE_WITH_COMPRESSED_DRAFT_KV:-1} # 1: optimize layer skips with compressed KV, 0: use uncompressed KV
 DYNAMIC_RETAIN_RATIO=${DYNAMIC_RETAIN_RATIO:-1}
+USE_SELECTED_SWIFT_CONFIG=${USE_SELECTED_SWIFT_CONFIG:-0}
+SELECTED_SWIFT_CONFIG_FILE=${SELECTED_SWIFT_CONFIG_FILE:-outputs/selected_swift_config.json}
+LOCAL_ADAPTIVE_CONTROLLER=${LOCAL_ADAPTIVE_CONTROLLER:-0}
+ADAPTIVE_RATIO_LADDER=${ADAPTIVE_RATIO_LADDER:-0.6,0.7,0.8,0.9,1.0}
+ADAPTIVE_WINDOW=${ADAPTIVE_WINDOW:-16}
+ADAPTIVE_MIN_OBSERVATIONS=${ADAPTIVE_MIN_OBSERVATIONS:-24}
+ADAPTIVE_STD_K=${ADAPTIVE_STD_K:-0.5}
+ADAPTIVE_UP_STD_K=${ADAPTIVE_UP_STD_K:-${ADAPTIVE_STD_K}}
+ADAPTIVE_DOWN_STD_K=${ADAPTIVE_DOWN_STD_K:-1.0}
+ADAPTIVE_STD_FLOOR=${ADAPTIVE_STD_FLOOR:-0.05}
+ADAPTIVE_PATIENCE=${ADAPTIVE_PATIENCE:-1}
+ADAPTIVE_COOLDOWN=${ADAPTIVE_COOLDOWN:-8}
 RETAIN_RATIO=${RETAIN_RATIO:-1.0}
 RETAIN_RATIO_GRID=${RETAIN_RATIO_GRID:-1.0,0.9,0.8,0.7,0.6}
 RETAIN_UTILITY_MODE=${RETAIN_UTILITY_MODE:-relative}
@@ -35,7 +47,7 @@ RETAIN_REFINE_ROUNDS=${RETAIN_REFINE_ROUNDS:-100}
 RETAIN_FINAL_TOLERANCE=${RETAIN_FINAL_TOLERANCE:-0.05}
 FINAL_LAYER_REFINE_ROUNDS=${FINAL_LAYER_REFINE_ROUNDS:-500}
 
-TASK_NAME=${TASK_NAME:-gsm8k} # gsm8k, mmlu, triviaqa, natural_questions, cnndm, humaneval, samsum
+TASK_NAME=${TASK_NAME:-gsm8k} # gsm8k, mmlu, triviaqa, natural_questions, cnndm, humaneval, samsum, mt_bench
 DATA_NUM=${DATA_NUM:-1000}
 TOP_P=${TOP_P:-1.0}
 
@@ -58,6 +70,9 @@ set_task_generation_params() {
     cnndm|humaneval)
       MAX_NEW_TOKENS=512
       ;;
+    mt_bench)
+      MAX_NEW_TOKENS=512
+      ;;
     *)
       echo "Unsupported TASK_NAME: ${TASK_NAME}" >&2
       exit 1
@@ -75,11 +90,20 @@ if [ -n "${DRAFT_TOKEN_NUM}" ]; then
   DRAFT_TOKEN_ARG="--draft-token-num ${DRAFT_TOKEN_NUM}"
 fi
 
+if [ "${LOCAL_ADAPTIVE_CONTROLLER}" = "1" ] && [ "${DYNAMIC_RETAIN_RATIO}" != "1" ]; then
+  USE_SELECTED_SWIFT_CONFIG=1
+fi
+
 if [ "${DYNAMIC_RETAIN_RATIO}" = "1" ]; then
   OPTIMIZE_WITH_COMPRESSED_DRAFT_KV=1
   if [[ ",${RETAIN_RATIO_GRID}," != *",${RETAIN_RATIO},"* ]]; then
     RETAIN_RATIO_GRID="${RETAIN_RATIO},${RETAIN_RATIO_GRID}"
   fi
+fi
+
+if [ "${USE_SELECTED_SWIFT_CONFIG}" = "1" ]; then
+  DYNAMIC_RETAIN_RATIO=0
+  OPTIMIZE_WITH_COMPRESSED_DRAFT_KV=1
 fi
 
 OPTIMIZATION_KV_ARG="--optimize-with-compressed-draft-kv"
@@ -92,6 +116,16 @@ fi
 DYNAMIC_RETAIN_ARG=""
 if [ "${DYNAMIC_RETAIN_RATIO}" = "1" ]; then
   DYNAMIC_RETAIN_ARG="--dynamic-retain-ratio --retain-ratio-grid ${RETAIN_RATIO_GRID} --retain-target-score ${MAX_SCORE} --retain-utility-mode ${RETAIN_UTILITY_MODE} --retain-compression-weight ${RETAIN_COMPRESSION_WEIGHT} --retain-score-tolerance ${RETAIN_SCORE_TOLERANCE} --retain-utility-lambda ${RETAIN_UTILITY_LAMBDA} --retain-ucb-c ${RETAIN_UCB_C} --retain-warmup-rounds ${RETAIN_WARMUP_ROUNDS} --retain-filter-top-k ${RETAIN_FILTER_TOP_K} --retain-refine-rounds ${RETAIN_REFINE_ROUNDS} --retain-final-tolerance ${RETAIN_FINAL_TOLERANCE} --final-layer-refine-rounds ${FINAL_LAYER_REFINE_ROUNDS}"
+fi
+
+SELECTED_SWIFT_CONFIG_ARG=""
+if [ "${USE_SELECTED_SWIFT_CONFIG}" = "1" ]; then
+  SELECTED_SWIFT_CONFIG_ARG="--load-selected-swift-config --selected-swift-config-file ${SELECTED_SWIFT_CONFIG_FILE}"
+fi
+
+LOCAL_ADAPTIVE_ARG=""
+if [ "${LOCAL_ADAPTIVE_CONTROLLER}" = "1" ]; then
+  LOCAL_ADAPTIVE_ARG="--local-adaptive-controller --adaptive-ratio-ladder ${ADAPTIVE_RATIO_LADDER} --adaptive-window ${ADAPTIVE_WINDOW} --adaptive-min-observations ${ADAPTIVE_MIN_OBSERVATIONS} --adaptive-std-k ${ADAPTIVE_STD_K} --adaptive-up-std-k ${ADAPTIVE_UP_STD_K} --adaptive-down-std-k ${ADAPTIVE_DOWN_STD_K} --adaptive-std-floor ${ADAPTIVE_STD_FLOOR} --adaptive-patience ${ADAPTIVE_PATIENCE} --adaptive-cooldown ${ADAPTIVE_COOLDOWN}"
 fi
 
 SKIP_LAYER_CACHE_FILE="outputs/skip_layer_cache.json"
@@ -110,8 +144,16 @@ baseline_answer_file() {
 swift_answer_file() {
   RETAIN_RATIO_ARG=$1
   RETAIN_RATIO_NAME=${RETAIN_RATIO_ARG}
-  if [ "${DYNAMIC_RETAIN_RATIO}" = "1" ]; then
+  if [ "${DYNAMIC_RETAIN_RATIO}" = "1" ] && [ "${LOCAL_ADAPTIVE_CONTROLLER}" = "1" ]; then
+    RETAIN_RATIO_NAME="dynamic3"
+  elif [ "${DYNAMIC_RETAIN_RATIO}" = "1" ]; then
     RETAIN_RATIO_NAME="dynamic-2"
+  elif [ "${USE_SELECTED_SWIFT_CONFIG}" = "1" ] && [ "${LOCAL_ADAPTIVE_CONTROLLER}" = "1" ]; then
+    RETAIN_RATIO_NAME="selected-config-adaptive"
+  elif [ "${USE_SELECTED_SWIFT_CONFIG}" = "1" ]; then
+    RETAIN_RATIO_NAME="selected-config"
+  elif [ "${LOCAL_ADAPTIVE_CONTROLLER}" = "1" ]; then
+    RETAIN_RATIO_NAME="adaptive-${RETAIN_RATIO_ARG}"
   fi
 
   DRAFT_TOKEN_SUFFIX=""
@@ -150,7 +192,7 @@ run_swift_eval() {
     --answer-file "${ANSWER_FILE}" \
     --temperature $TEMP --top-p ${TOP_P} --dtype $torch_dtype --task-name ${TASK_NAME} --data-num ${DATA_NUM} --max-new-tokens ${MAX_NEW_TOKENS} \
     --seed $SEED --context-window ${CONTEXT_WINDOW} --opt-interval ${OPT_INTERVAL} --bayes-interval ${BAYES_INTERVAL} --max-opt-iter ${MAX_OPT_ITER} \
-    --max-tolerance-iter ${MAX_TOLERANCE_ITER} --max-score ${MAX_SCORE} --skip-ratio ${SKIP_RATIO} ${DRAFT_TOKEN_ARG} ${OPTIMIZATION_KV_ARG} ${DYNAMIC_RETAIN_ARG} ${CACHE_ARG} \
+    --max-tolerance-iter ${MAX_TOLERANCE_ITER} --max-score ${MAX_SCORE} --skip-ratio ${SKIP_RATIO} ${DRAFT_TOKEN_ARG} ${OPTIMIZATION_KV_ARG} ${DYNAMIC_RETAIN_ARG} ${SELECTED_SWIFT_CONFIG_ARG} ${LOCAL_ADAPTIVE_ARG} ${CACHE_ARG} \
     --optimization --bayes --draft-kv-compress --draft-kv-retain-ratio ${RETAIN_RATIO_ARG}
 
   if [ "${DO_QUALITY_EVAL}" = "1" ]; then
@@ -172,6 +214,11 @@ run_skip_layer_calibration() {
 run_swift_benchmark() {
   run_skip_layer_calibration
   if [ "${DYNAMIC_RETAIN_RATIO}" = "1" ]; then
+    run_swift_eval ${RETAIN_RATIO} ""
+    return 0
+  fi
+
+  if [ "${USE_SELECTED_SWIFT_CONFIG}" = "1" ]; then
     run_swift_eval ${RETAIN_RATIO} ""
     return 0
   fi

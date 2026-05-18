@@ -50,6 +50,12 @@ def format_retain_ratio_grid(retain_ratios):
 
 
 def retain_ratio_run_name(args):
+    if getattr(args, "local_adaptive_controller", False):
+        if getattr(args, "dynamic_retain_ratio", False):
+            return "dynamic3"
+        if getattr(args, "load_selected_swift_config", False):
+            return "selected-config-adaptive"
+        return "adaptive-" + str(args.draft_kv_retain_ratio)
     if args.dynamic_retain_ratio:
         return "dynamic-2"
     return str(args.draft_kv_retain_ratio)
@@ -66,6 +72,261 @@ def build_layer_optimizer(num_hidden_layers, random_state=1):
     )
     optimizer.set_gp_params(alpha=1e-2)
     return optimizer
+
+
+def _ratio_key(retain_ratio):
+    return str(float(retain_ratio))
+
+
+def _initialize_local_adaptive_state(statistics, model):
+    if not statistics.get("local_adaptive_controller", False):
+        return None
+
+    if statistics.get("dynamic_retain_ratio", False):
+        initial_ratio = float(statistics.get(
+            "retain_final_ratio",
+            statistics.get(
+                "best_retain_ratio",
+                statistics.get("draft_kv_retain_ratio", 1.0),
+            ),
+        ))
+    else:
+        initial_ratio = float(statistics.get(
+            "adaptive_initial_retain_ratio",
+            statistics.get("draft_kv_retain_ratio", 1.0),
+        ))
+    ladder = [float(retain_ratio) for retain_ratio in statistics.get("adaptive_ratio_ladder", [initial_ratio])]
+    if not any(abs(initial_ratio - retain_ratio) < 1e-9 for retain_ratio in ladder):
+        ladder.append(initial_ratio)
+    ladder = sorted(set(ladder))
+    current_level = min(range(len(ladder)), key=lambda idx: abs(ladder[idx] - initial_ratio))
+    current_ratio = float(ladder[current_level])
+
+    model.draft_kv_retain_ratio = current_ratio
+    statistics.setdefault("adaptive_total_switches", 0)
+    statistics.setdefault("adaptive_question_count", 0)
+    statistics.setdefault("adaptive_questions_with_switch", 0)
+    statistics.setdefault("adaptive_ratio_step_counts", {})
+    statistics.setdefault("adaptive_final_ratio_counts", {})
+    statistics.setdefault("adaptive_global_accepted_tokens", 0)
+    statistics.setdefault("adaptive_global_draft_tokens", 0)
+    statistics.setdefault("adaptive_global_step_acceptance_history", [])
+    statistics["adaptive_question_count"] += 1
+    statistics["adaptive_last_sample"] = None
+    statistics["adaptive_current_ratio"] = current_ratio
+
+    return {
+        "ladder": ladder,
+        "level": current_level,
+        "initial_ratio": current_ratio,
+        "current_ratio": current_ratio,
+        "accepted_history": [],
+        "draft_history": [],
+        "step_acceptance_history": [],
+        "ratio_history": [],
+        "switches": [],
+        "low_streak": 0,
+        "high_streak": 0,
+        "cooldown": 0,
+    }
+
+
+def _local_adaptive_ready(statistics):
+    if not statistics.get("local_adaptive_controller", False):
+        return False
+    if statistics.get("dynamic_retain_ratio", False):
+        return (
+            not statistics.get("optimization", False)
+            and (
+                statistics.get("retain_stage") == "done"
+                or "retain_final_ratio" in statistics
+                or "best_retain_ratio" in statistics
+            )
+        )
+    return True
+
+
+def _local_adaptive_acceptance_state(statistics, state, window):
+    accepted_history = state["accepted_history"]
+    draft_history = state["draft_history"]
+
+    window_accepted = sum(accepted_history[-window:])
+    window_draft = sum(draft_history[-window:])
+    window_acceptance = window_accepted / window_draft if window_draft > 0 else 0.0
+
+    reference_accepted = int(statistics.get("adaptive_global_accepted_tokens", 0))
+    reference_draft = int(statistics.get("adaptive_global_draft_tokens", 0))
+    reference_steps = statistics.get("adaptive_global_step_acceptance_history", [])
+    reference_acceptance = (
+        reference_accepted / reference_draft
+        if reference_draft > 0
+        else window_acceptance
+    )
+    reference_std = float(np.std(reference_steps)) if len(reference_steps) > 1 else 0.0
+    return window_acceptance, reference_acceptance, reference_std, len(reference_steps)
+
+
+def _record_local_adaptive_global_step(statistics, accepted_tokens, drafted_tokens, step_acceptance):
+    statistics["adaptive_global_accepted_tokens"] = (
+        int(statistics.get("adaptive_global_accepted_tokens", 0)) + accepted_tokens
+    )
+    statistics["adaptive_global_draft_tokens"] = (
+        int(statistics.get("adaptive_global_draft_tokens", 0)) + drafted_tokens
+    )
+    reference_steps = statistics.setdefault("adaptive_global_step_acceptance_history", [])
+    reference_steps.append(float(step_acceptance))
+
+
+def _set_local_adaptive_ratio(statistics, model, state, new_level, step_idx, direction,
+                              window_acceptance, reference_acceptance, threshold_std,
+                              lower_threshold, upper_threshold, reference_observations,
+                              up_std_k, down_std_k):
+    old_ratio = float(state["current_ratio"])
+    new_ratio = float(state["ladder"][new_level])
+    state["level"] = int(new_level)
+    state["current_ratio"] = new_ratio
+    state["low_streak"] = 0
+    state["high_streak"] = 0
+    state["cooldown"] = int(statistics.get("adaptive_cooldown", 0))
+    model.draft_kv_retain_ratio = new_ratio
+    statistics["adaptive_current_ratio"] = new_ratio
+    statistics["adaptive_total_switches"] += 1
+
+    switch = {
+        "step": int(step_idx),
+        "direction": direction,
+        "old_ratio": old_ratio,
+        "new_ratio": new_ratio,
+        "window_acceptance": float(window_acceptance),
+        "reference_acceptance": float(reference_acceptance),
+        "reference_observations": int(reference_observations),
+        "threshold_std": float(threshold_std),
+        "up_std_k": float(up_std_k),
+        "down_std_k": float(down_std_k),
+        "lower_threshold": float(lower_threshold),
+        "upper_threshold": float(upper_threshold),
+    }
+    state["switches"].append(switch)
+    logging.info(
+        "Local adaptive ratio {}: {:.4f} -> {:.4f} "
+        "(window {:.4f}, global reference {:.4f}, std {:.4f})".format(
+            direction, old_ratio, new_ratio, window_acceptance, reference_acceptance, threshold_std
+        )
+    )
+
+
+def _update_local_adaptive_controller(
+        statistics, model, state, step_idx, accepted_tokens, drafted_tokens, allow_switch=True):
+    if state is None or drafted_tokens <= 0:
+        return
+
+    accepted_tokens = max(0, int(accepted_tokens))
+    drafted_tokens = max(1, int(drafted_tokens))
+    step_acceptance = accepted_tokens / drafted_tokens
+
+    state["accepted_history"].append(accepted_tokens)
+    state["draft_history"].append(drafted_tokens)
+    state["step_acceptance_history"].append(step_acceptance)
+    state["ratio_history"].append(float(state["current_ratio"]))
+
+    ratio_counts = statistics.setdefault("adaptive_ratio_step_counts", {})
+    ratio_key = _ratio_key(state["current_ratio"])
+    ratio_counts[ratio_key] = int(ratio_counts.get(ratio_key, 0)) + 1
+
+    window = int(statistics.get("adaptive_window", 32))
+    min_observations = int(statistics.get("adaptive_min_observations", window))
+    observation_count = len(state["step_acceptance_history"])
+
+    if allow_switch and observation_count >= window and observation_count >= min_observations:
+        if state["cooldown"] > 0:
+            state["cooldown"] -= 1
+        else:
+            (
+                window_acceptance,
+                reference_acceptance,
+                reference_std,
+                reference_observations,
+            ) = _local_adaptive_acceptance_state(statistics, state, window)
+            effective_std = max(reference_std, float(statistics.get("adaptive_std_floor", 0.05)))
+            up_std_k = float(statistics.get("adaptive_up_std_k", statistics.get("adaptive_std_k", 1.0)))
+            down_std_k = float(statistics.get("adaptive_down_std_k", statistics.get("adaptive_std_k", 1.0)))
+            lower_threshold = reference_acceptance - up_std_k * effective_std
+            upper_threshold = reference_acceptance + down_std_k * effective_std
+            patience = max(1, int(statistics.get("adaptive_patience", 1)))
+
+            if window_acceptance < lower_threshold:
+                state["low_streak"] += 1
+                state["high_streak"] = 0
+                if state["low_streak"] >= patience and state["level"] < len(state["ladder"]) - 1:
+                    _set_local_adaptive_ratio(
+                        statistics,
+                        model,
+                        state,
+                        state["level"] + 1,
+                        step_idx,
+                        "up",
+                        window_acceptance,
+                        reference_acceptance,
+                        effective_std,
+                        lower_threshold,
+                        upper_threshold,
+                        reference_observations,
+                        up_std_k,
+                        down_std_k,
+                    )
+            elif window_acceptance > upper_threshold:
+                state["high_streak"] += 1
+                state["low_streak"] = 0
+                if state["high_streak"] >= patience and state["level"] > 0:
+                    _set_local_adaptive_ratio(
+                        statistics,
+                        model,
+                        state,
+                        state["level"] - 1,
+                        step_idx,
+                        "down",
+                        window_acceptance,
+                        reference_acceptance,
+                        effective_std,
+                        lower_threshold,
+                        upper_threshold,
+                        reference_observations,
+                        up_std_k,
+                        down_std_k,
+                    )
+            else:
+                state["low_streak"] = 0
+                state["high_streak"] = 0
+
+    _record_local_adaptive_global_step(statistics, accepted_tokens, drafted_tokens, step_acceptance)
+
+
+def _finish_local_adaptive_sample(statistics, state, total_accepted_tokens, total_draft_tokens):
+    if state is None:
+        return
+
+    final_ratio = float(state["current_ratio"])
+    final_ratio_counts = statistics.setdefault("adaptive_final_ratio_counts", {})
+    final_ratio_key = _ratio_key(final_ratio)
+    final_ratio_counts[final_ratio_key] = int(final_ratio_counts.get(final_ratio_key, 0)) + 1
+    if state["switches"]:
+        statistics["adaptive_questions_with_switch"] += 1
+
+    total_draft_tokens = max(0, int(total_draft_tokens))
+    total_accepted_tokens = max(0, int(total_accepted_tokens))
+    sample_acceptance = total_accepted_tokens / total_draft_tokens if total_draft_tokens > 0 else 0.0
+    sample_state = {
+        "initial_ratio": float(state["initial_ratio"]),
+        "final_ratio": final_ratio,
+        "switch_count": len(state["switches"]),
+        "switches": state["switches"],
+        "ratio_step_counts": {},
+        "sample_acceptance": float(sample_acceptance),
+    }
+    for retain_ratio in state["ratio_history"]:
+        ratio_key = _ratio_key(retain_ratio)
+        sample_state["ratio_step_counts"][ratio_key] = sample_state["ratio_step_counts"].get(ratio_key, 0) + 1
+    statistics["adaptive_last_sample"] = sample_state
 
 
 def build_skip_layer_cache_key(args):
@@ -182,6 +443,10 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
     
     model.draft_kv_compress = statistics.get("draft_kv_compress", False)
     model.draft_kv_retain_ratio = statistics.get("draft_kv_retain_ratio", 1.0)
+    statistics["adaptive_last_sample"] = None
+    local_adaptive_state = None
+    if _local_adaptive_ready(statistics):
+        local_adaptive_state = _initialize_local_adaptive_state(statistics, model)
     fixed_draft_token_num = statistics.get("draft_token_num", None)
     stop_patterns = _compile_stop_patterns(stop_config)
     eos_token_ids = _get_eos_token_ids(model, tokenizer)
@@ -205,7 +470,8 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
     total_acc_num = 0
     for idx in range(max_steps):
         # drafted tokens + 1 bonus verified token
-        draft_token_num += len(top1_prob)
+        step_draft_token_num = len(top1_prob)
+        draft_token_num += step_draft_token_num
         # Initialize the swift buffer
         swift_choices = eval(f"{get_choices_list(top1_prob, logits_processor=logits_processor)}")
         swift_buffers = generate_swift_buffers(swift_choices, device=model.model.layers[-1].self_attn.q_proj.weight.device)
@@ -278,11 +544,22 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
         accept_length_list.append(accept_length_tree)
         total_acc_num += accept_length_tree - 1
 
-        if _contains_eos_token(input_ids[0, input_len:].tolist(), eos_token_ids):
-            break
-        if _should_stop_generation(input_ids, input_len, tokenizer, stop_patterns, stop_config):
-            break
-        if new_token_num > max_new_tokens:
+        should_stop = (
+            _contains_eos_token(input_ids[0, input_len:].tolist(), eos_token_ids)
+            or _should_stop_generation(input_ids, input_len, tokenizer, stop_patterns, stop_config)
+            or new_token_num > max_new_tokens
+        )
+        _update_local_adaptive_controller(
+            statistics,
+            model,
+            local_adaptive_state,
+            idx,
+            accept_length_tree - 1,
+            step_draft_token_num,
+            allow_switch=not should_stop,
+        )
+
+        if should_stop:
             break
 
         # layer set optimization
@@ -312,6 +589,7 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             draft_token_num=fixed_draft_token_num,
         )
     logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
+    _finish_local_adaptive_sample(statistics, local_adaptive_state, total_acc_num, draft_token_num)
     return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num
 
 
@@ -675,6 +953,78 @@ if __name__ == "__main__":
         default=False,
         help="Load a skip-layer set and disable layer-set optimization.",
     )
+    parser.add_argument(
+        "--selected-swift-config-file",
+        type=str,
+        default="outputs/selected_swift_config.json",
+        help="File containing one selected retain-ratio/skip-layer config per benchmark.",
+    )
+    parser.add_argument(
+        "--load-selected-swift-config",
+        action="store_true",
+        default=False,
+        help="Load the selected benchmark-level retain-ratio/skip-layer config and disable optimization.",
+    )
+    parser.add_argument(
+        "--local-adaptive-controller",
+        action="store_true",
+        default=False,
+        help="Adapt draft KV retain ratio within each question using local acceptance statistics.",
+    )
+    parser.add_argument(
+        "--adaptive-ratio-ladder",
+        type=str,
+        default="0.6,0.7,0.8,0.9,1.0",
+        help="Comma-separated retain-ratio ladder for local adaptive control.",
+    )
+    parser.add_argument(
+        "--adaptive-window",
+        type=int,
+        default=16,
+        help="Sliding window size, in SWIFT decoding steps, for local adaptive control.",
+    )
+    parser.add_argument(
+        "--adaptive-min-observations",
+        type=int,
+        default=24,
+        help="Minimum observed SWIFT decoding steps before local adaptive switching is enabled.",
+    )
+    parser.add_argument(
+        "--adaptive-std-k",
+        type=float,
+        default=0.5,
+        help="Fallback number of global running standard deviations used as the adaptive switch threshold.",
+    )
+    parser.add_argument(
+        "--adaptive-up-std-k",
+        type=float,
+        default=None,
+        help="Global running standard-deviation multiplier used when raising retain ratio.",
+    )
+    parser.add_argument(
+        "--adaptive-down-std-k",
+        type=float,
+        default=None,
+        help="Global running standard-deviation multiplier used when lowering retain ratio.",
+    )
+    parser.add_argument(
+        "--adaptive-std-floor",
+        type=float,
+        default=0.05,
+        help="Lower bound for the running acceptance standard deviation.",
+    )
+    parser.add_argument(
+        "--adaptive-patience",
+        type=int,
+        default=1,
+        help="Consecutive low/high windows required before changing retain ratio.",
+    )
+    parser.add_argument(
+        "--adaptive-cooldown",
+        type=int,
+        default=8,
+        help="Number of SWIFT decoding steps to wait after an adaptive ratio switch.",
+    )
 
     args = parser.parse_args()
     if args.draft_token_num is not None and args.draft_token_num <= 0:
@@ -691,6 +1041,26 @@ if __name__ == "__main__":
         parser.error("--retain-final-tolerance must be non-negative.")
     if args.final_layer_refine_rounds < 0:
         parser.error("--final-layer-refine-rounds must be non-negative.")
+    if args.adaptive_window <= 0:
+        parser.error("--adaptive-window must be a positive integer.")
+    if args.adaptive_min_observations <= 0:
+        parser.error("--adaptive-min-observations must be a positive integer.")
+    if args.adaptive_std_k < 0.0:
+        parser.error("--adaptive-std-k must be non-negative.")
+    if args.adaptive_up_std_k is None:
+        args.adaptive_up_std_k = args.adaptive_std_k
+    if args.adaptive_down_std_k is None:
+        args.adaptive_down_std_k = args.adaptive_std_k
+    if args.adaptive_up_std_k < 0.0:
+        parser.error("--adaptive-up-std-k must be non-negative.")
+    if args.adaptive_down_std_k < 0.0:
+        parser.error("--adaptive-down-std-k must be non-negative.")
+    if args.adaptive_std_floor < 0.0:
+        parser.error("--adaptive-std-floor must be non-negative.")
+    if args.adaptive_patience <= 0:
+        parser.error("--adaptive-patience must be a positive integer.")
+    if args.adaptive_cooldown < 0:
+        parser.error("--adaptive-cooldown must be non-negative.")
     try:
         args.retain_ratio_grid_values = parse_retain_ratio_grid(
             args.retain_ratio_grid,
@@ -723,6 +1093,45 @@ if __name__ == "__main__":
         parser.error("--dynamic-retain-ratio cannot be combined with cached skip-layer loading.")
     if args.save_skip_layer_cache and args.load_skip_layer_cache:
         parser.error("--save-skip-layer-cache and --load-skip-layer-cache are mutually exclusive.")
+    if args.load_selected_swift_config:
+        if args.dynamic_retain_ratio:
+            parser.error("--load-selected-swift-config cannot be combined with --dynamic-retain-ratio.")
+        if args.load_skip_layer_cache or args.cache_hit or args.save_skip_layer_cache:
+            parser.error("--load-selected-swift-config cannot be combined with other skip-layer cache modes.")
+        if not args.draft_kv_compress:
+            parser.error("--load-selected-swift-config requires --draft-kv-compress.")
+    if args.local_adaptive_controller:
+        if args.draft_only:
+            parser.error("--local-adaptive-controller is not supported with --draft-only.")
+        if not args.draft_kv_compress:
+            parser.error("--local-adaptive-controller requires --draft-kv-compress.")
+        if not args.dynamic_retain_ratio and not args.load_selected_swift_config:
+            parser.error("--local-adaptive-controller requires either --dynamic-retain-ratio or --load-selected-swift-config.")
+
+    selected_swift_config = None
+    if args.load_selected_swift_config:
+        selected_swift_config = get_selected_swift_config(
+            args.selected_swift_config_file,
+            args.model_id,
+            args.task_name,
+        )
+        if selected_swift_config is None:
+            raise FileNotFoundError(
+                f"Selected SWIFT config not found for task '{args.task_name}' "
+                f"in {args.selected_swift_config_file}."
+            )
+        args.draft_kv_retain_ratio = float(selected_swift_config["draft_kv_retain_ratio"])
+        args.skip_ratio = float(selected_swift_config.get("skip_ratio", args.skip_ratio))
+        args.optimization, args.bayes = False, False
+
+    try:
+        args.adaptive_ratio_ladder_values = parse_retain_ratio_grid(
+            args.adaptive_ratio_ladder,
+            initial_ratio=args.draft_kv_retain_ratio if args.local_adaptive_controller else None,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.adaptive_ratio_ladder = format_retain_ratio_grid(args.adaptive_ratio_ladder_values)
 
     args.skip_layer_cache_key = args.skip_layer_cache_key or build_skip_layer_cache_key(args)
 
@@ -754,7 +1163,11 @@ if __name__ == "__main__":
     else:
         logits_processor = None
 
-    if args.load_skip_layer_cache:
+    if args.load_selected_swift_config:
+        _attn_skip_layer_id_set = selected_swift_config["attention"]
+        _mlp_skip_layer_id_set = selected_swift_config["mlp"]
+        args.optimization, args.bayes = False, False
+    elif args.load_skip_layer_cache:
         cached_skip_layers = get_skip_layer_cache(args.skip_layer_cache_file, args.skip_layer_cache_key)
         if cached_skip_layers is None:
             raise FileNotFoundError(
@@ -810,7 +1223,19 @@ if __name__ == "__main__":
                   "retain_filter_top_k": args.retain_filter_top_k,
                   "retain_refine_rounds": args.retain_refine_rounds,
                   "retain_final_tolerance": args.retain_final_tolerance,
-                  "final_layer_refine_rounds": args.final_layer_refine_rounds}
+                  "final_layer_refine_rounds": args.final_layer_refine_rounds,
+                  "local_adaptive_controller": args.local_adaptive_controller,
+                  "adaptive_initial_retain_ratio": args.draft_kv_retain_ratio,
+                  "adaptive_ratio_ladder": args.adaptive_ratio_ladder_values,
+                  "adaptive_window": args.adaptive_window,
+                  "adaptive_min_observations": args.adaptive_min_observations,
+                  "adaptive_reference_mode": "global",
+                  "adaptive_std_k": args.adaptive_std_k,
+                  "adaptive_up_std_k": args.adaptive_up_std_k,
+                  "adaptive_down_std_k": args.adaptive_down_std_k,
+                  "adaptive_std_floor": args.adaptive_std_floor,
+                  "adaptive_patience": args.adaptive_patience,
+                  "adaptive_cooldown": args.adaptive_cooldown}
 
     forward_f = draft_only_forward if args.draft_only else swift_forward
     run_eval(

@@ -448,6 +448,36 @@ def clip_input(
         end_prompt = "\nAnswer:"
         inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
 
+    elif task_name == "mt_bench":
+        turns = [turn.strip() for turn in prompt.get("turns", []) if str(turn).strip()]
+        current_turn_idx = prompt.get("_current_turn_idx", 0)
+        current_turn = turns[current_turn_idx] if current_turn_idx < len(turns) else (turns[0] if turns else "")
+        previous_outputs = prompt.get("_previous_outputs", [])
+
+        if is_instruct and hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+            messages = [{"role": "system", "content": "You are a helpful assistant."}]
+            for prev_idx in range(min(current_turn_idx, len(previous_outputs), len(turns))):
+                messages.append({"role": "user", "content": turns[prev_idx]})
+                messages.append({"role": "assistant", "content": str(previous_outputs[prev_idx]).strip()})
+            messages.append({"role": "user", "content": current_turn})
+            formatted = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = tokenizer(formatted, return_tensors="pt").to(device)
+        else:
+            prompt_text = prompt_shots + "System: You are a helpful assistant.\n"
+            for prev_idx in range(min(current_turn_idx, len(previous_outputs), len(turns))):
+                prompt_text += (
+                    "User: "
+                    + turns[prev_idx]
+                    + "\nAssistant: "
+                    + str(previous_outputs[prev_idx]).strip()
+                    + "\n"
+                )
+            prompt_text += "User: " + current_turn + "\nAssistant:"
+            end_prompt = "\nAssistant:"
+            inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+
     elif is_qa_task(task_name):
         prompt_text = (
             prompt_shots
@@ -545,6 +575,40 @@ def load_data(task_name, seed, data_num=10):
             dataset = dataset.select(range(data_num))
         data = dataset
 
+    elif task_name == "mt_bench":
+        # Load MT-Bench from local FastChat data
+        import os
+        fastchat_mt_bench_path = None
+        
+        # Try to find FastChat MT-Bench data in common locations
+        possible_paths = [
+            "./FastChat/fastchat/llm_judge/data/mt_bench/question.jsonl",
+            "../FastChat/fastchat/llm_judge/data/mt_bench/question.jsonl",
+            "../../FastChat/fastchat/llm_judge/data/mt_bench/question.jsonl",
+            "/home/tjlin/KV_SSD/SWIFT/FastChat/fastchat/llm_judge/data/mt_bench/question.jsonl",
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                fastchat_mt_bench_path = path
+                break
+        
+        if fastchat_mt_bench_path is None:
+            raise ValueError(
+                "MT-Bench dataset not found. Please ensure FastChat/fastchat/llm_judge/data/mt_bench/question.jsonl exists."
+            )
+        
+        # Load and parse JSONL file
+        data = []
+        with open(fastchat_mt_bench_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    sample = json.loads(line)
+                    data.append(sample)
+        
+        if data_num is not None and data_num < len(data):
+            data = data[:data_num]
+
     else:
         raise ValueError(f"Unsupported task: {task_name}")
 
@@ -631,56 +695,174 @@ def get_model_answers(
     for question_idx, question in enumerate(tqdm(data)):
         choices = []
 
-        input_ids = clip_input(
-            tokenizer,
-            question,
-            task_name,
-            device=model.model.embed_tokens.weight.device,
-            max_new_tokens=max_new_tokens,
-            prompt_shots=prompt_shots,
-            max_output_length=model.config.max_position_embeddings,
-            model_id=model_id,
-        )
+        # MT-Bench needs one FastChat-compatible answer row per question.
+        if task_name == "mt_bench":
+            turns_outputs = []
+            turns = [turn.strip() for turn in question.get("turns", []) if str(turn).strip()]
+            question_for_inference = dict(question)
+            cur_accept_lengths_tree = []
+            cur_draft_num = 0
+            steps = []
+            new_tokens = []
+            wall_time = []
+            adaptive_samples = []
 
-        cur_accept_lengths_tree = []
-        cur_draft_num = 0
-        steps = []
-        new_tokens = []
-        wall_time = []
+            for turn_idx in range(len(turns)):
+                question_for_inference["_current_turn_idx"] = turn_idx
+                question_for_inference["_previous_outputs"] = turns_outputs
 
-        safe_cuda_synchronize()
-        start_time = time.time()
-        output_ids, new_token_num, step, accept_length_tree, draft_token_num = forward_func(
-            input_ids,
-            model,
-            tokenizer,
-            max_new_tokens,
-            **forward_kwargs,
-        )
-        safe_cuda_synchronize()
-        total_time = time.time() - start_time
+                input_ids = clip_input(
+                    tokenizer,
+                    question_for_inference,
+                    task_name,
+                    device=model.model.embed_tokens.weight.device,
+                    max_new_tokens=max_new_tokens,
+                    prompt_shots=prompt_shots,
+                    max_output_length=model.config.max_position_embeddings,
+                    model_id=model_id,
+                )
 
-        cur_accept_lengths_tree.extend(accept_length_tree)
-        cur_draft_num += draft_token_num
-        output_ids = output_ids[0][len(input_ids[0]):]
+                safe_cuda_synchronize()
+                start_time = time.time()
+                output_ids, new_token_num, step, accept_length_tree, draft_token_num = forward_func(
+                    input_ids,
+                    model,
+                    tokenizer,
+                    max_new_tokens,
+                    **forward_kwargs,
+                )
+                safe_cuda_synchronize()
+                total_time = time.time() - start_time
 
-        output = tokenizer.decode(
-            output_ids,
-            spaces_between_special_tokens=False,
-        )
-        for special_token in tokenizer.special_tokens_map.values():
-            if isinstance(special_token, list):
-                for special_tok in special_token:
-                    output = output.replace(special_tok, "")
+                cur_accept_lengths_tree.extend(accept_length_tree)
+                cur_draft_num += int(draft_token_num)
+
+                if output_ids.dim() == 2:
+                    generated_ids = output_ids[0][len(input_ids[0]):]
+                elif output_ids.dim() == 1:
+                    generated_ids = output_ids[len(input_ids[0]):]
+                else:
+                    raise ValueError(f"Unexpected output_ids shape: {output_ids.shape}")
+
+                output = tokenizer.decode(
+                    generated_ids,
+                    spaces_between_special_tokens=False,
+                )
+                for special_token in tokenizer.special_tokens_map.values():
+                    if isinstance(special_token, list):
+                        for special_tok in special_token:
+                            output = output.replace(special_tok, "")
+                    else:
+                        output = output.replace(special_token, "")
+                output = output.strip()
+
+                turns_outputs.append(output)
+                steps.append(int(step))
+                new_tokens.append(int(new_token_num))
+                wall_time.append(total_time)
+
+                runtime_statistics = forward_kwargs.get("statistics")
+                if runtime_statistics and runtime_statistics.get("local_adaptive_controller"):
+                    adaptive_sample = runtime_statistics.get("adaptive_last_sample")
+                    if adaptive_sample is not None:
+                        adaptive_samples.append(adaptive_sample)
+
+            accept_lengths_tree.extend(cur_accept_lengths_tree)
+            total_draft_num += cur_draft_num
+
+            if cur_draft_num > 0:
+                sample_acceptance_rate = (sum(cur_accept_lengths_tree) - len(cur_accept_lengths_tree)) / cur_draft_num
             else:
-                output = output.replace(special_token, "")
-        output = output.strip()
-        if is_qa_task(task_name):
-            output = clean_qa_output(output)
+                sample_acceptance_rate = 0.0
 
-        steps.append(int(step))
-        new_tokens.append(int(new_token_num))
-        wall_time.append(total_time)
+            metrics = {
+                "question_index": question_idx,
+                "task_name": task_name,
+                "prompt_turns": question.get("turns", []),
+                "decoding_steps": steps,
+                "new_tokens": new_tokens,
+                "wall_time": wall_time,
+                "accept_lengths": cur_accept_lengths_tree,
+                "acceptance_rate": sample_acceptance_rate,
+            }
+            if adaptive_samples:
+                metrics["adaptive"] = adaptive_samples
+
+            mt_question_id = question.get("question_id", question_idx)
+            ans_json = {
+                "question_index": question_idx,
+                "question_id": mt_question_id,
+                "answer_id": f"{model_id}-{mt_question_id}",
+                "model_id": model_id,
+                "choices": [{"index": 0, "turns": turns_outputs}],
+                "tstamp": time.time(),
+                "metrics": metrics,
+            }
+            if "category" in question:
+                ans_json["category"] = question["category"]
+
+            with open(os.path.expanduser(answer_file), "a", encoding="utf-8") as fout:
+                fout.write(json.dumps(ans_json, ensure_ascii=False) + "\n")
+            continue
+
+        else:
+            input_ids = clip_input(
+                tokenizer,
+                question,
+                task_name,
+                device=model.model.embed_tokens.weight.device,
+                max_new_tokens=max_new_tokens,
+                prompt_shots=prompt_shots,
+                max_output_length=model.config.max_position_embeddings,
+                model_id=model_id,
+            )
+
+            cur_accept_lengths_tree = []
+            cur_draft_num = 0
+            steps = []
+            new_tokens = []
+            wall_time = []
+
+            safe_cuda_synchronize()
+            start_time = time.time()
+            output_ids, new_token_num, step, accept_length_tree, draft_token_num = forward_func(
+                input_ids,
+                model,
+                tokenizer,
+                max_new_tokens,
+                **forward_kwargs,
+            )
+            safe_cuda_synchronize()
+            total_time = time.time() - start_time
+
+            cur_accept_lengths_tree.extend(accept_length_tree)
+            cur_draft_num += draft_token_num
+            
+            # Handle both 1D and 2D output_ids tensors
+            if output_ids.dim() == 2:
+                output_ids = output_ids[0][len(input_ids[0]):]
+            elif output_ids.dim() == 1:
+                output_ids = output_ids[len(input_ids[0]):]
+            else:
+                raise ValueError(f"Unexpected output_ids shape: {output_ids.shape}")
+
+            output = tokenizer.decode(
+                output_ids,
+                spaces_between_special_tokens=False,
+            )
+            for special_token in tokenizer.special_tokens_map.values():
+                if isinstance(special_token, list):
+                    for special_tok in special_token:
+                        output = output.replace(special_tok, "")
+                else:
+                    output = output.replace(special_token, "")
+            output = output.strip()
+            if is_qa_task(task_name):
+                output = clean_qa_output(output)
+
+            steps.append(int(step))
+            new_tokens.append(int(new_token_num))
+            wall_time.append(total_time)
 
         accept_lengths_tree.extend(cur_accept_lengths_tree)
         total_draft_num += cur_draft_num
@@ -698,6 +880,11 @@ def get_model_answers(
             "accept_lengths": cur_accept_lengths_tree,
             "acceptance_rate": sample_acceptance_rate,
         }
+        runtime_statistics = forward_kwargs.get("statistics")
+        if runtime_statistics and runtime_statistics.get("local_adaptive_controller"):
+            adaptive_sample = runtime_statistics.get("adaptive_last_sample")
+            if adaptive_sample is not None:
+                sample_record["adaptive"] = adaptive_sample
 
         sample_correct = None
 
@@ -833,7 +1020,33 @@ def get_model_answers(
         summary["Retain Candidate Ratios"] = runtime_statistics.get("retain_candidate_ratios")
         summary["Retain Final Ratio"] = runtime_statistics.get("retain_final_ratio")
         summary["Retain Ratio Search State"] = runtime_statistics.get("retain_ratio_state", {})
-    elif hasattr(model, "draft_kv_retain_ratio"):
+    if runtime_statistics and runtime_statistics.get("local_adaptive_controller"):
+        summary["Local Adaptive Controller"] = True
+        summary["Draft KV Retain Ratio"] = float(runtime_statistics.get("retain_final_ratio", runtime_statistics.get("adaptive_initial_retain_ratio", 1.0)))
+        summary["Adaptive Starts After Dynamic"] = bool(runtime_statistics.get("dynamic_retain_ratio", False))
+        summary["Adaptive Ratio Ladder"] = runtime_statistics.get("adaptive_ratio_ladder", [])
+        summary["Adaptive Window"] = int(runtime_statistics.get("adaptive_window", 16))
+        summary["Adaptive Min Observations"] = int(runtime_statistics.get("adaptive_min_observations", 24))
+        summary["Adaptive Reference Mode"] = runtime_statistics.get("adaptive_reference_mode", "global")
+        summary["Adaptive Std K"] = float(runtime_statistics.get("adaptive_std_k", 0.5))
+        summary["Adaptive Up Std K"] = float(runtime_statistics.get("adaptive_up_std_k", runtime_statistics.get("adaptive_std_k", 0.5)))
+        summary["Adaptive Down Std K"] = float(runtime_statistics.get("adaptive_down_std_k", runtime_statistics.get("adaptive_std_k", 0.5)))
+        summary["Adaptive Std Floor"] = float(runtime_statistics.get("adaptive_std_floor", 0.05))
+        summary["Adaptive Patience"] = int(runtime_statistics.get("adaptive_patience", 1))
+        summary["Adaptive Cooldown"] = int(runtime_statistics.get("adaptive_cooldown", 8))
+        adaptive_global_draft = int(runtime_statistics.get("adaptive_global_draft_tokens", 0))
+        summary["Adaptive Global Observations"] = len(runtime_statistics.get("adaptive_global_step_acceptance_history", []))
+        summary["Adaptive Global Acceptance Rate"] = (
+            float(runtime_statistics.get("adaptive_global_accepted_tokens", 0)) / adaptive_global_draft
+            if adaptive_global_draft > 0
+            else None
+        )
+        summary["Adaptive Total Switches"] = int(runtime_statistics.get("adaptive_total_switches", 0))
+        summary["Adaptive Question Count"] = int(runtime_statistics.get("adaptive_question_count", 0))
+        summary["Adaptive Questions With Switch"] = int(runtime_statistics.get("adaptive_questions_with_switch", 0))
+        summary["Adaptive Ratio Step Counts"] = runtime_statistics.get("adaptive_ratio_step_counts", {})
+        summary["Adaptive Final Ratio Counts"] = runtime_statistics.get("adaptive_final_ratio_counts", {})
+    elif (not runtime_statistics or not runtime_statistics.get("dynamic_retain_ratio")) and hasattr(model, "draft_kv_retain_ratio"):
         summary["Draft KV Retain Ratio"] = float(model.draft_kv_retain_ratio)
 
     if total_scored > 0:
@@ -851,6 +1064,13 @@ def get_model_answers(
         summary["ROUGE-L"] = total_rougeL / total_rouge_scored
         summary["Total ROUGE Scored"] = total_rouge_scored
 
+    if task_name == "mt_bench":
+        summary = {
+            "question_id": "__summary__",
+            "task_name": task_name,
+            **summary,
+        }
+
     with open(os.path.expanduser(answer_file), "a", encoding="utf-8") as fout:
         fout.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
@@ -862,6 +1082,8 @@ def get_model_answers(
         print("Best Draft KV Retain Ratio:", summary["Best Draft KV Retain Ratio"])
     elif "Draft KV Retain Ratio" in summary:
         print("Draft KV Retain Ratio:", summary["Draft KV Retain Ratio"])
+    if "Adaptive Total Switches" in summary:
+        print("Adaptive Total Switches:", summary["Adaptive Total Switches"])
     if "Accuracy" in summary:
         print("Accuracy:", summary["Accuracy"])
     if "Exact Match" in summary:

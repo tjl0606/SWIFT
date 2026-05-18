@@ -92,6 +92,37 @@ def get_skip_layer_cache(file_name, cache_key):
     return entry["attention"], entry["mlp"]
 
 
+def get_selected_swift_config(file_name, model_name, task_name):
+    """
+    Load one benchmark-level SWIFT config containing retain ratio and skip layers.
+    """
+    if not os.path.exists(file_name):
+        print(f"Selected SWIFT config file not found: {file_name}")
+        return None
+
+    with open(file_name, encoding="utf-8") as f:
+        data = json.load(f)
+
+    benchmarks = data.get("benchmarks", data)
+    entry = benchmarks.get(task_name)
+    if entry is None:
+        entry = benchmarks.get(f"{model_name}_{task_name}")
+    if entry is None:
+        print(f"Selected SWIFT config not found for task '{task_name}'.")
+        return None
+
+    config_model = entry.get("model_id")
+    if config_model is not None and config_model != model_name:
+        print(
+            f"Selected SWIFT config model mismatch: expected {model_name}, "
+            f"found {config_model}."
+        )
+        return None
+
+    print(f"Use selected SWIFT config for '{task_name}' from {file_name}.")
+    return entry
+
+
 def save_skip_layer_cache(file_name, cache_key, attn_skip_layers, mlp_skip_layers, metadata=None):
     """
     Save a benchmark-specific skip-layer configuration.

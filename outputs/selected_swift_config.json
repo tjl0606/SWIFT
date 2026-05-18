@@ -1,0 +1,280 @@
+{
+  "metadata": {
+    "created_by": "evaluation_llama/build_selected_swift_config.py",
+    "outputs_dir": "outputs",
+    "metric": "token_acceptance_rate",
+    "selection_rule": "Rank fixed-ratio opt_compressed_draft_kv=True runs by metric. If the second-best retain ratio is lower than the best retain ratio, select the second-best candidate; otherwise select the best candidate."
+  },
+  "benchmarks": {
+    "gsm8k": {
+      "model_id": "Meta-Llama-3-8B-Instruct",
+      "task_name": "gsm8k",
+      "data_num": 1000,
+      "draft_kv_retain_ratio": 0.8,
+      "skip_ratio": 0.45,
+      "attention": [
+        3,
+        5,
+        7,
+        8,
+        9,
+        17,
+        18,
+        19,
+        21,
+        22,
+        23,
+        24,
+        25,
+        27,
+        29
+      ],
+      "mlp": [
+        3,
+        4,
+        5,
+        6,
+        9,
+        15,
+        17,
+        21,
+        23,
+        24,
+        26,
+        30
+      ],
+      "token_acceptance_rate": 0.6409106990309693,
+      "mean_accepted_tokens": 2.9045720293348376,
+      "selected_rank": 2,
+      "source_file": "outputs/gsm8k/gsm8k_1000/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-256-opt_interval-1-max_score-0.93-context_window-50-skip_ratio-0.45-draft_kv_retain_ratio-0.8-opt_compressed_draft_kv-True-draft_token_num-3.jsonl",
+      "best_candidate": {
+        "draft_kv_retain_ratio": 0.9,
+        "token_acceptance_rate": 0.6811850186664525,
+        "mean_accepted_tokens": 3.023813310010336,
+        "source_file": "outputs/gsm8k/gsm8k_1000/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-256-opt_interval-1-max_score-0.93-context_window-50-skip_ratio-0.45-draft_kv_retain_ratio-0.9-opt_compressed_draft_kv-True-draft_token_num-3.jsonl"
+      },
+      "second_candidate": {
+        "draft_kv_retain_ratio": 0.8,
+        "token_acceptance_rate": 0.6409106990309693,
+        "mean_accepted_tokens": 2.9045720293348376,
+        "source_file": "outputs/gsm8k/gsm8k_1000/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-256-opt_interval-1-max_score-0.93-context_window-50-skip_ratio-0.45-draft_kv_retain_ratio-0.8-opt_compressed_draft_kv-True-draft_token_num-3.jsonl"
+      }
+    },
+    "mmlu": {
+      "model_id": "Meta-Llama-3-8B-Instruct",
+      "task_name": "mmlu",
+      "data_num": 1000,
+      "draft_kv_retain_ratio": 0.6,
+      "skip_ratio": 0.45,
+      "attention": [
+        4,
+        6,
+        7,
+        8,
+        9,
+        11,
+        14,
+        16,
+        17,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        29
+      ],
+      "mlp": [
+        7,
+        8,
+        9,
+        10,
+        15,
+        19,
+        25,
+        26,
+        29
+      ],
+      "token_acceptance_rate": 0.6506158968806814,
+      "mean_accepted_tokens": 2.9310746246938133,
+      "selected_rank": 2,
+      "source_file": "outputs/mmlu/mmlu_1000/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-256-opt_interval-1-max_score-0.93-context_window-50-skip_ratio-0.45-draft_kv_retain_ratio-0.6-opt_compressed_draft_kv-True-draft_token_num-3.jsonl",
+      "best_candidate": {
+        "draft_kv_retain_ratio": 0.99,
+        "token_acceptance_rate": 0.7070658993552854,
+        "mean_accepted_tokens": 3.097904791249422,
+        "source_file": "outputs/mmlu/mmlu_1000/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-256-opt_interval-1-max_score-0.93-context_window-50-skip_ratio-0.45-draft_kv_retain_ratio-0.99-opt_compressed_draft_kv-True-draft_token_num-3.jsonl"
+      },
+      "second_candidate": {
+        "draft_kv_retain_ratio": 0.6,
+        "token_acceptance_rate": 0.6506158968806814,
+        "mean_accepted_tokens": 2.9310746246938133,
+        "source_file": "outputs/mmlu/mmlu_1000/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-256-opt_interval-1-max_score-0.93-context_window-50-skip_ratio-0.45-draft_kv_retain_ratio-0.6-opt_compressed_draft_kv-True-draft_token_num-3.jsonl"
+      }
+    },
+    "natural_questions": {
+      "model_id": "Meta-Llama-3-8B-Instruct",
+      "task_name": "natural_questions",
+      "data_num": 1000,
+      "draft_kv_retain_ratio": 0.6,
+      "skip_ratio": 0.45,
+      "attention": [
+        2,
+        4,
+        8,
+        9,
+        12,
+        13,
+        15,
+        17,
+        18,
+        19,
+        20,
+        23,
+        24,
+        25,
+        27,
+        30
+      ],
+      "mlp": [
+        1,
+        4,
+        9,
+        10,
+        12,
+        13,
+        16,
+        20,
+        21,
+        26,
+        30
+      ],
+      "token_acceptance_rate": 0.5076023391812865,
+      "mean_accepted_tokens": 2.4311243484735665,
+      "selected_rank": 2,
+      "source_file": "outputs/natural_questions/natural_questions_1000/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-32-opt_interval-1-max_score-0.93-context_window-16-skip_ratio-0.45-draft_kv_retain_ratio-0.6-opt_compressed_draft_kv-True-draft_token_num-3.jsonl",
+      "best_candidate": {
+        "draft_kv_retain_ratio": 0.9,
+        "token_acceptance_rate": 0.5131858704166511,
+        "mean_accepted_tokens": 2.4456236208889357,
+        "source_file": "outputs/natural_questions/natural_questions_1000/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-32-opt_interval-1-max_score-0.93-context_window-16-skip_ratio-0.45-draft_kv_retain_ratio-0.9-opt_compressed_draft_kv-True-draft_token_num-3.jsonl"
+      },
+      "second_candidate": {
+        "draft_kv_retain_ratio": 0.6,
+        "token_acceptance_rate": 0.5076023391812865,
+        "mean_accepted_tokens": 2.4311243484735665,
+        "source_file": "outputs/natural_questions/natural_questions_1000/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-32-opt_interval-1-max_score-0.93-context_window-16-skip_ratio-0.45-draft_kv_retain_ratio-0.6-opt_compressed_draft_kv-True-draft_token_num-3.jsonl"
+      }
+    },
+    "samsum": {
+      "model_id": "Meta-Llama-3-8B-Instruct",
+      "task_name": "samsum",
+      "data_num": 100,
+      "draft_kv_retain_ratio": 0.8,
+      "skip_ratio": 0.45,
+      "attention": [
+        2,
+        4,
+        8,
+        9,
+        12,
+        13,
+        15,
+        17,
+        18,
+        19,
+        20,
+        23,
+        24,
+        25,
+        27,
+        30
+      ],
+      "mlp": [
+        1,
+        4,
+        9,
+        10,
+        12,
+        13,
+        16,
+        20,
+        21,
+        26,
+        30
+      ],
+      "token_acceptance_rate": 0.44895624821275376,
+      "mean_accepted_tokens": 2.3149078726968173,
+      "selected_rank": 2,
+      "source_file": "outputs/samsum/samsum_100/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-64-opt_interval-1-max_score-0.93-context_window-50-skip_ratio-0.45-draft_kv_retain_ratio-0.8-opt_compressed_draft_kv-True-draft_token_num-3.jsonl",
+      "best_candidate": {
+        "draft_kv_retain_ratio": 0.99,
+        "token_acceptance_rate": 0.4566097772635233,
+        "mean_accepted_tokens": 2.3382789317507418,
+        "source_file": "outputs/samsum/samsum_100/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-64-opt_interval-1-max_score-0.93-context_window-50-skip_ratio-0.45-draft_kv_retain_ratio-0.99-opt_compressed_draft_kv-True-draft_token_num-3.jsonl"
+      },
+      "second_candidate": {
+        "draft_kv_retain_ratio": 0.8,
+        "token_acceptance_rate": 0.44895624821275376,
+        "mean_accepted_tokens": 2.3149078726968173,
+        "source_file": "outputs/samsum/samsum_100/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-64-opt_interval-1-max_score-0.93-context_window-50-skip_ratio-0.45-draft_kv_retain_ratio-0.8-opt_compressed_draft_kv-True-draft_token_num-3.jsonl"
+      }
+    },
+    "triviaqa": {
+      "model_id": "Meta-Llama-3-8B-Instruct",
+      "task_name": "triviaqa",
+      "data_num": 1000,
+      "draft_kv_retain_ratio": 0.9,
+      "skip_ratio": 0.45,
+      "attention": [
+        1,
+        5,
+        6,
+        10,
+        11,
+        12,
+        13,
+        14,
+        16,
+        18,
+        19,
+        23,
+        24,
+        26,
+        27
+      ],
+      "mlp": [
+        2,
+        7,
+        8,
+        9,
+        10,
+        11,
+        13,
+        19,
+        22,
+        23,
+        27,
+        28
+      ],
+      "token_acceptance_rate": 0.6363078954815583,
+      "mean_accepted_tokens": 2.779111169721746,
+      "selected_rank": 1,
+      "source_file": "outputs/triviaqa/triviaqa_1000/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-32-opt_interval-1-max_score-0.93-context_window-16-skip_ratio-0.45-draft_kv_retain_ratio-0.9-opt_compressed_draft_kv-True-draft_token_num-3.jsonl",
+      "best_candidate": {
+        "draft_kv_retain_ratio": 0.9,
+        "token_acceptance_rate": 0.6363078954815583,
+        "mean_accepted_tokens": 2.779111169721746,
+        "source_file": "outputs/triviaqa/triviaqa_1000/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-32-opt_interval-1-max_score-0.93-context_window-16-skip_ratio-0.45-draft_kv_retain_ratio-0.9-opt_compressed_draft_kv-True-draft_token_num-3.jsonl"
+      },
+      "second_candidate": {
+        "draft_kv_retain_ratio": 0.99,
+        "token_acceptance_rate": 0.6362567599341641,
+        "mean_accepted_tokens": 2.780497433872878,
+        "source_file": "outputs/triviaqa/triviaqa_1000/without_layerskip_draft_model_answer/Meta-Llama-3-8B-Instruct/Meta-Llama-3-8B-Instruct-swift-bfloat16-temp-0.0-top-p-1.0-seed-2024-max_new_tokens-32-opt_interval-1-max_score-0.93-context_window-16-skip_ratio-0.45-draft_kv_retain_ratio-0.99-opt_compressed_draft_kv-True-draft_token_num-3.jsonl"
+      }
+    }
+  }
+}
