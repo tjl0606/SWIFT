@@ -331,7 +331,7 @@ def generate_swift_buffers(swift_choices, device="cuda"):
 
 
 def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key_values_data, current_length_data,
-                     logits_processor=None, draft_token_num=None):
+                     logits_processor=None, draft_token_num=None, statistics=None):
     """
     Initializes the swift structure for a given model.
     """
@@ -339,7 +339,18 @@ def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key
         # Normal verify path: must not reuse a stale tree mask
         _clear_swift_tree_state(model)
 
-        outputs, logits = swift_verify(model, input_ids, past_key_values=past_key_values)
+        collect_cosine = bool(statistics and statistics.get("cosine_prefill_skip_layers", False))
+        if collect_cosine:
+            _start_attn_cosine_collection(model)
+
+        try:
+            outputs, logits = swift_verify(model, input_ids, past_key_values=past_key_values)
+        finally:
+            if collect_cosine:
+                cosine_scores = _finish_attn_cosine_collection(model)
+
+        if collect_cosine:
+            _apply_cosine_prefill_skip_layers(model, statistics, cosine_scores)
 
         if logits_processor is not None:
             last_logits = logits[:, -1]
@@ -687,6 +698,118 @@ def reset_swift_mode(model):
     Resets the swift settings to their initial state.
     """
     _clear_swift_tree_state(model)
+
+
+def _start_attn_cosine_collection(model):
+    for layer in getattr(model.model, "layers", []):
+        layer.collect_attn_cosine = True
+        layer.last_attn_cosine = None
+
+
+def _finish_attn_cosine_collection(model):
+    scores = []
+    for layer in getattr(model.model, "layers", []):
+        layer.collect_attn_cosine = False
+        score = getattr(layer, "last_attn_cosine", None)
+        if score is None:
+            scores.append(float("nan"))
+        else:
+            scores.append(float(score.float().cpu().item()))
+        layer.last_attn_cosine = None
+    return scores
+
+
+def _cosine_eligible_attn_layers(num_hidden_layers, statistics):
+    keep_first = max(0, int(statistics.get("cosine_keep_first_layers", 1)))
+    keep_last = max(0, int(statistics.get("cosine_keep_last_layers", 2)))
+    last_exclusive = max(keep_first, num_hidden_layers - keep_last)
+    return list(range(keep_first, last_exclusive))
+
+
+def _safe_cosine_score(scores, layer_id):
+    if layer_id < 0 or layer_id >= len(scores):
+        return -1.0
+    score = scores[layer_id]
+    if isinstance(score, float) and math.isnan(score):
+        return -1.0
+    return float(score)
+
+
+def _rank_layers_by_cosine(scores, eligible_layers):
+    return sorted(
+        [int(layer_id) for layer_id in eligible_layers],
+        key=lambda layer_id: (-_safe_cosine_score(scores, layer_id), int(layer_id)),
+    )
+
+
+def _build_cosine_attn_skip_layers(scores, statistics):
+    eligible_layers = _cosine_eligible_attn_layers(len(scores), statistics)
+    ranked_layers = _rank_layers_by_cosine(scores, eligible_layers)
+    mode = statistics.get("cosine_skip_mode", "topk")
+    max_skip_layers = statistics.get("cosine_max_skip_layers")
+
+    if max_skip_layers is None:
+        max_skip_layers = int(len(eligible_layers) * float(statistics.get("skip_ratio", 0.0)))
+    max_skip_layers = max(0, min(int(max_skip_layers), len(eligible_layers)))
+
+    if mode == "threshold":
+        alpha = float(statistics.get("cosine_attn_alpha", 0.985))
+        selected = [
+            layer_id
+            for layer_id in ranked_layers
+            if _safe_cosine_score(scores, layer_id) >= alpha
+        ]
+        if max_skip_layers > 0:
+            selected = selected[:max_skip_layers]
+    else:
+        selected = ranked_layers[:max_skip_layers]
+
+    return selected, ranked_layers, eligible_layers
+
+
+def _build_cosine_mlp_skip_layers(num_hidden_layers, statistics):
+    interval = int(statistics.get("cosine_mlp_interval", 0))
+    if interval <= 0:
+        return []
+
+    keep_first = max(0, int(statistics.get("cosine_keep_first_layers", 1)))
+    keep_last = max(0, int(statistics.get("cosine_keep_last_layers", 2)))
+    last_exclusive = max(keep_first, num_hidden_layers - keep_last)
+    return [
+        layer_id
+        for layer_id in range(keep_first, last_exclusive)
+        if (layer_id + 1) % interval == 0
+    ]
+
+
+def _apply_cosine_prefill_skip_layers(model, statistics, cosine_scores):
+    attn_skip_layers, ranked_layers, eligible_layers = _build_cosine_attn_skip_layers(
+        cosine_scores,
+        statistics,
+    )
+    mlp_skip_layers = _build_cosine_mlp_skip_layers(len(cosine_scores), statistics)
+
+    model.set_skip_layers(attn_skip_layers, mlp_skip_layers)
+
+    statistics["cosine_attn_scores"] = [float(score) for score in cosine_scores]
+    statistics["cosine_attn_ranking"] = [int(layer_id) for layer_id in ranked_layers]
+    statistics["cosine_attn_eligible_layers"] = [int(layer_id) for layer_id in eligible_layers]
+    statistics["cosine_attn_skip_layers"] = [int(layer_id) for layer_id in attn_skip_layers]
+    statistics["cosine_mlp_skip_layers"] = [int(layer_id) for layer_id in mlp_skip_layers]
+    statistics["cosine_current_attn_skip_count"] = len(attn_skip_layers)
+    statistics["cosine_prefill_count"] = int(statistics.get("cosine_prefill_count", 0)) + 1
+    statistics["cosine_attn_skip_count_sum"] = (
+        int(statistics.get("cosine_attn_skip_count_sum", 0)) + len(attn_skip_layers)
+    )
+    statistics["cosine_mlp_skip_count_sum"] = (
+        int(statistics.get("cosine_mlp_skip_count_sum", 0)) + len(mlp_skip_layers)
+    )
+
+    logging.info(
+        "Cosine prefill skip layers: attn=%s mlp=%s",
+        statistics["cosine_attn_skip_layers"],
+        statistics["cosine_mlp_skip_layers"],
+    )
 
 
 def rebuild_compressed_draft_cache(

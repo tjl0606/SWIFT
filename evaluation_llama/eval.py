@@ -136,8 +136,33 @@ def extract_mmlu_pred(output_text):
     return matches[0] if matches else None
 
 
+MMLU_TRIM_PATTERNS = [
+    r"\bthe following is a multiple choice question\b",
+    r"\n\s*question\s*[:：]",
+    r"\.{2,}\s*(?:more|less)\b",
+    r"<\|[^>]*header_id\|>",
+]
+
+
+def clean_mmlu_output(output_text):
+    cleaned = output_text.strip()
+    first_match = None
+    for pattern in MMLU_TRIM_PATTERNS:
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE | re.DOTALL)
+        if match and (first_match is None or match.start() < first_match.start()):
+            first_match = match
+    if first_match:
+        cleaned = cleaned[: first_match.start()].strip()
+    return cleaned
+
+
 def get_generation_stop_config(task_name):
     task_name = normalize_task_name(task_name)
+    if task_name == "mmlu":
+        return {
+            "patterns": MMLU_TRIM_PATTERNS,
+            "min_chars_before_match": 0,
+        }
     if is_qa_task(task_name):
         return {
             "patterns": [
@@ -151,7 +176,6 @@ def get_generation_stop_config(task_name):
         }
 
     return None
-
 
 def normalize_qa_answer(text):
     text = str(text).lower()
@@ -434,19 +458,32 @@ def clip_input(
 
     elif task_name == "mmlu":
         choices = prompt["choices"]
-        prompt_text = (
+        user_content = (
             prompt_shots
             + "The following is a multiple choice question. "
-            + "Answer with only the letter A, B, C, or D.\n\n"
+            + "Choose the best answer and provide a concise explanation. "
+            + "Respond in exactly this format:\n"
+            + "Answer: <A, B, C, or D>\n"
+            + "Explanation: <brief explanation>\n\n"
             + f"Question: {prompt['question'].strip()}\n"
             + f"A. {choices[0]}\n"
             + f"B. {choices[1]}\n"
             + f"C. {choices[2]}\n"
-            + f"D. {choices[3]}\n"
-            + "Answer:"
+            + f"D. {choices[3]}"
         )
-        end_prompt = "\nAnswer:"
-        inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+        if is_instruct and hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+            messages = [
+                {"role": "system", "content": "You answer multiple choice questions with concise reasoning."},
+                {"role": "user", "content": user_content},
+            ]
+            formatted = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = tokenizer(formatted, return_tensors="pt").to(device)
+        else:
+            prompt_text = user_content + "\nAnswer:"
+            end_prompt = "\nAnswer:"
+            inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
 
     elif task_name == "mt_bench":
         turns = [turn.strip() for turn in prompt.get("turns", []) if str(turn).strip()]
@@ -857,7 +894,10 @@ def get_model_answers(
                 else:
                     output = output.replace(special_token, "")
             output = output.strip()
-            if is_qa_task(task_name):
+            raw_output = output
+            if task_name == "mmlu":
+                output = clean_mmlu_output(output)
+            elif is_qa_task(task_name):
                 output = clean_qa_output(output)
 
             steps.append(int(step))
@@ -880,6 +920,8 @@ def get_model_answers(
             "accept_lengths": cur_accept_lengths_tree,
             "acceptance_rate": sample_acceptance_rate,
         }
+        if task_name == "mmlu" and raw_output != output:
+            sample_record["raw_turns"] = raw_output
         runtime_statistics = forward_kwargs.get("statistics")
         if runtime_statistics and runtime_statistics.get("local_adaptive_controller"):
             adaptive_sample = runtime_statistics.get("adaptive_last_sample")
@@ -994,6 +1036,28 @@ def get_model_answers(
         summary["Best MLP Layer Set"] = [int(x) for x in list(best_mlp_skip_layer_id_set)]
 
     runtime_statistics = forward_kwargs.get("statistics")
+    if runtime_statistics and runtime_statistics.get("cosine_prefill_skip_layers"):
+        summary["Cosine Prefill Skip Layers"] = True
+        summary["Cosine Skip Mode"] = runtime_statistics.get("cosine_skip_mode", "topk")
+        summary["Cosine Attn Alpha"] = float(runtime_statistics.get("cosine_attn_alpha", 0.985))
+        summary["Cosine Max Skip Layers"] = runtime_statistics.get("cosine_max_skip_layers")
+        summary["Cosine Keep First Layers"] = int(runtime_statistics.get("cosine_keep_first_layers", 1))
+        summary["Cosine Keep Last Layers"] = int(runtime_statistics.get("cosine_keep_last_layers", 2))
+        summary["Cosine MLP Interval"] = int(runtime_statistics.get("cosine_mlp_interval", 0))
+        summary["Cosine Prefill Count"] = int(runtime_statistics.get("cosine_prefill_count", 0))
+        prefill_count = int(runtime_statistics.get("cosine_prefill_count", 0))
+        summary["Cosine Avg Attn Skip Count"] = (
+            float(runtime_statistics.get("cosine_attn_skip_count_sum", 0)) / prefill_count
+            if prefill_count > 0
+            else None
+        )
+        summary["Cosine Avg MLP Skip Count"] = (
+            float(runtime_statistics.get("cosine_mlp_skip_count_sum", 0)) / prefill_count
+            if prefill_count > 0
+            else None
+        )
+        summary["Last Cosine Attn Layer Set"] = runtime_statistics.get("cosine_attn_skip_layers", [])
+        summary["Last Cosine MLP Layer Set"] = runtime_statistics.get("cosine_mlp_skip_layers", [])
     if runtime_statistics and runtime_statistics.get("dynamic_retain_ratio"):
         summary["Dynamic Retain Ratio"] = True
         summary["Best Draft KV Retain Ratio"] = float(
@@ -1042,6 +1106,11 @@ def get_model_answers(
             else None
         )
         summary["Adaptive Total Switches"] = int(runtime_statistics.get("adaptive_total_switches", 0))
+        summary["Adaptive Layer Controller"] = bool(runtime_statistics.get("adaptive_layer_controller", False))
+        summary["Adaptive Layer Fallback Window"] = int(runtime_statistics.get("adaptive_layer_fallback_window", 16))
+        summary["Adaptive Layer Improvement Delta"] = float(runtime_statistics.get("adaptive_layer_improvement_delta", 0.0))
+        summary["Adaptive Layer Total Switches"] = int(runtime_statistics.get("adaptive_layer_total_switches", 0))
+        summary["Adaptive Layer Questions With Switch"] = int(runtime_statistics.get("adaptive_layer_questions_with_switch", 0))
         summary["Adaptive Question Count"] = int(runtime_statistics.get("adaptive_question_count", 0))
         summary["Adaptive Questions With Switch"] = int(runtime_statistics.get("adaptive_questions_with_switch", 0))
         summary["Adaptive Ratio Step Counts"] = runtime_statistics.get("adaptive_ratio_step_counts", {})

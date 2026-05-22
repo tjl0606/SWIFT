@@ -53,11 +53,15 @@ def retain_ratio_run_name(args):
     if getattr(args, "local_adaptive_controller", False):
         if getattr(args, "dynamic_retain_ratio", False):
             return "dynamic3"
+        if getattr(args, "cosine_prefill_skip_layers", False):
+            return "dynamic-4"
         if getattr(args, "load_selected_swift_config", False):
             return "selected-config-adaptive"
         return "adaptive-" + str(args.draft_kv_retain_ratio)
     if args.dynamic_retain_ratio:
         return "dynamic-2"
+    if getattr(args, "cosine_prefill_skip_layers", False):
+        return "dynamic-4"
     return str(args.draft_kv_retain_ratio)
 
 
@@ -108,6 +112,8 @@ def _initialize_local_adaptive_state(statistics, model):
     statistics.setdefault("adaptive_questions_with_switch", 0)
     statistics.setdefault("adaptive_ratio_step_counts", {})
     statistics.setdefault("adaptive_final_ratio_counts", {})
+    statistics.setdefault("adaptive_layer_total_switches", 0)
+    statistics.setdefault("adaptive_layer_questions_with_switch", 0)
     statistics.setdefault("adaptive_global_accepted_tokens", 0)
     statistics.setdefault("adaptive_global_draft_tokens", 0)
     statistics.setdefault("adaptive_global_step_acceptance_history", [])
@@ -125,6 +131,8 @@ def _initialize_local_adaptive_state(statistics, model):
         "step_acceptance_history": [],
         "ratio_history": [],
         "switches": [],
+        "layer_switches": [],
+        "pending_ratio_probe": None,
         "low_streak": 0,
         "high_streak": 0,
         "cooldown": 0,
@@ -207,12 +215,125 @@ def _set_local_adaptive_ratio(statistics, model, state, new_level, step_idx, dir
         "upper_threshold": float(upper_threshold),
     }
     state["switches"].append(switch)
+    if _adaptive_layer_controller_enabled(statistics) and direction == "up":
+        state["pending_ratio_probe"] = {
+            "step": int(step_idx),
+            "old_ratio": old_ratio,
+            "new_ratio": new_ratio,
+            "baseline_acceptance": float(window_acceptance),
+        }
     logging.info(
         "Local adaptive ratio {}: {:.4f} -> {:.4f} "
         "(window {:.4f}, global reference {:.4f}, std {:.4f})".format(
             direction, old_ratio, new_ratio, window_acceptance, reference_acceptance, threshold_std
         )
     )
+
+
+def _adaptive_layer_controller_enabled(statistics):
+    return bool(
+        statistics.get("adaptive_layer_controller", False)
+        and statistics.get("cosine_prefill_skip_layers", False)
+    )
+
+
+def _cosine_score_for_layer(statistics, layer_id):
+    scores = statistics.get("cosine_attn_scores", [])
+    if layer_id < 0 or layer_id >= len(scores):
+        return -1.0
+    try:
+        return float(scores[layer_id])
+    except (TypeError, ValueError):
+        return -1.0
+
+
+def _reduce_one_cosine_skip_layer(statistics, model, state, step_idx, reason,
+                                  window_acceptance=None, reference_acceptance=None):
+    if not _adaptive_layer_controller_enabled(statistics):
+        return False
+
+    attn_skip_layers, mlp_skip_layers = model.get_skip_layers()
+    attn_skip_layers = [int(layer_id) for layer_id in list(attn_skip_layers)]
+    mlp_skip_layers = [int(layer_id) for layer_id in list(mlp_skip_layers)]
+    if not attn_skip_layers:
+        return False
+
+    layer_to_restore = min(
+        attn_skip_layers,
+        key=lambda layer_id: (_cosine_score_for_layer(statistics, layer_id), -int(layer_id)),
+    )
+    new_attn_skip_layers = [
+        layer_id for layer_id in attn_skip_layers if layer_id != layer_to_restore
+    ]
+    model.set_skip_layers(new_attn_skip_layers, mlp_skip_layers)
+
+    statistics["cosine_attn_skip_layers"] = [int(layer_id) for layer_id in new_attn_skip_layers]
+    statistics["cosine_current_attn_skip_count"] = len(new_attn_skip_layers)
+    statistics["adaptive_layer_total_switches"] = int(
+        statistics.get("adaptive_layer_total_switches", 0)
+    ) + 1
+
+    switch = {
+        "step": int(step_idx),
+        "direction": "less_skip",
+        "reason": reason,
+        "restored_attn_layer": int(layer_to_restore),
+        "restored_attn_layer_cosine": float(_cosine_score_for_layer(statistics, layer_to_restore)),
+        "old_attn_skip_count": int(len(attn_skip_layers)),
+        "new_attn_skip_count": int(len(new_attn_skip_layers)),
+    }
+    if window_acceptance is not None:
+        switch["window_acceptance"] = float(window_acceptance)
+    if reference_acceptance is not None:
+        switch["reference_acceptance"] = float(reference_acceptance)
+
+    state["layer_switches"].append(switch)
+    state["pending_ratio_probe"] = None
+    state["low_streak"] = 0
+    state["high_streak"] = 0
+    state["cooldown"] = int(statistics.get("adaptive_cooldown", 0))
+    logging.info(
+        "Local adaptive layer less_skip: restored attn layer %s (cosine %.4f), skip_count %s -> %s",
+        layer_to_restore,
+        switch["restored_attn_layer_cosine"],
+        len(attn_skip_layers),
+        len(new_attn_skip_layers),
+    )
+    return True
+
+
+def _maybe_finish_pending_ratio_probe(statistics, model, state, step_idx):
+    probe = state.get("pending_ratio_probe")
+    if not probe or not _adaptive_layer_controller_enabled(statistics):
+        return False
+
+    fallback_window = max(1, int(statistics.get("adaptive_layer_fallback_window", 16)))
+    if int(step_idx) - int(probe["step"]) < fallback_window:
+        return False
+
+    window = int(statistics.get("adaptive_window", 32))
+    (
+        window_acceptance,
+        reference_acceptance,
+        _reference_std,
+        _reference_observations,
+    ) = _local_adaptive_acceptance_state(statistics, state, window)
+    min_delta = float(statistics.get("adaptive_layer_improvement_delta", 0.0))
+    baseline_acceptance = float(probe.get("baseline_acceptance", 0.0))
+
+    if window_acceptance <= baseline_acceptance + min_delta:
+        return _reduce_one_cosine_skip_layer(
+            statistics,
+            model,
+            state,
+            step_idx,
+            "ratio_probe_no_improvement",
+            window_acceptance=window_acceptance,
+            reference_acceptance=reference_acceptance,
+        )
+
+    state["pending_ratio_probe"] = None
+    return False
 
 
 def _update_local_adaptive_controller(
@@ -241,62 +362,75 @@ def _update_local_adaptive_controller(
         if state["cooldown"] > 0:
             state["cooldown"] -= 1
         else:
-            (
-                window_acceptance,
-                reference_acceptance,
-                reference_std,
-                reference_observations,
-            ) = _local_adaptive_acceptance_state(statistics, state, window)
-            effective_std = max(reference_std, float(statistics.get("adaptive_std_floor", 0.05)))
-            up_std_k = float(statistics.get("adaptive_up_std_k", statistics.get("adaptive_std_k", 1.0)))
-            down_std_k = float(statistics.get("adaptive_down_std_k", statistics.get("adaptive_std_k", 1.0)))
-            lower_threshold = reference_acceptance - up_std_k * effective_std
-            upper_threshold = reference_acceptance + down_std_k * effective_std
-            patience = max(1, int(statistics.get("adaptive_patience", 1)))
+            layer_adjusted = _maybe_finish_pending_ratio_probe(statistics, model, state, step_idx)
+            if not layer_adjusted and state.get("pending_ratio_probe") is None:
+                (
+                    window_acceptance,
+                    reference_acceptance,
+                    reference_std,
+                    reference_observations,
+                ) = _local_adaptive_acceptance_state(statistics, state, window)
+                effective_std = max(reference_std, float(statistics.get("adaptive_std_floor", 0.05)))
+                up_std_k = float(statistics.get("adaptive_up_std_k", statistics.get("adaptive_std_k", 1.0)))
+                down_std_k = float(statistics.get("adaptive_down_std_k", statistics.get("adaptive_std_k", 1.0)))
+                lower_threshold = reference_acceptance - up_std_k * effective_std
+                upper_threshold = reference_acceptance + down_std_k * effective_std
+                patience = max(1, int(statistics.get("adaptive_patience", 1)))
 
-            if window_acceptance < lower_threshold:
-                state["low_streak"] += 1
-                state["high_streak"] = 0
-                if state["low_streak"] >= patience and state["level"] < len(state["ladder"]) - 1:
-                    _set_local_adaptive_ratio(
-                        statistics,
-                        model,
-                        state,
-                        state["level"] + 1,
-                        step_idx,
-                        "up",
-                        window_acceptance,
-                        reference_acceptance,
-                        effective_std,
-                        lower_threshold,
-                        upper_threshold,
-                        reference_observations,
-                        up_std_k,
-                        down_std_k,
-                    )
-            elif window_acceptance > upper_threshold:
-                state["high_streak"] += 1
-                state["low_streak"] = 0
-                if state["high_streak"] >= patience and state["level"] > 0:
-                    _set_local_adaptive_ratio(
-                        statistics,
-                        model,
-                        state,
-                        state["level"] - 1,
-                        step_idx,
-                        "down",
-                        window_acceptance,
-                        reference_acceptance,
-                        effective_std,
-                        lower_threshold,
-                        upper_threshold,
-                        reference_observations,
-                        up_std_k,
-                        down_std_k,
-                    )
-            else:
-                state["low_streak"] = 0
-                state["high_streak"] = 0
+                if window_acceptance < lower_threshold:
+                    state["low_streak"] += 1
+                    state["high_streak"] = 0
+                    if state["low_streak"] >= patience:
+                        if state["level"] < len(state["ladder"]) - 1:
+                            _set_local_adaptive_ratio(
+                                statistics,
+                                model,
+                                state,
+                                state["level"] + 1,
+                                step_idx,
+                                "up",
+                                window_acceptance,
+                                reference_acceptance,
+                                effective_std,
+                                lower_threshold,
+                                upper_threshold,
+                                reference_observations,
+                                up_std_k,
+                                down_std_k,
+                            )
+                        else:
+                            _reduce_one_cosine_skip_layer(
+                                statistics,
+                                model,
+                                state,
+                                step_idx,
+                                "low_acceptance_at_max_ratio",
+                                window_acceptance=window_acceptance,
+                                reference_acceptance=reference_acceptance,
+                            )
+                elif window_acceptance > upper_threshold:
+                    state["high_streak"] += 1
+                    state["low_streak"] = 0
+                    if state["high_streak"] >= patience and state["level"] > 0:
+                        _set_local_adaptive_ratio(
+                            statistics,
+                            model,
+                            state,
+                            state["level"] - 1,
+                            step_idx,
+                            "down",
+                            window_acceptance,
+                            reference_acceptance,
+                            effective_std,
+                            lower_threshold,
+                            upper_threshold,
+                            reference_observations,
+                            up_std_k,
+                            down_std_k,
+                        )
+                else:
+                    state["low_streak"] = 0
+                    state["high_streak"] = 0
 
     _record_local_adaptive_global_step(statistics, accepted_tokens, drafted_tokens, step_acceptance)
 
@@ -311,6 +445,8 @@ def _finish_local_adaptive_sample(statistics, state, total_accepted_tokens, tota
     final_ratio_counts[final_ratio_key] = int(final_ratio_counts.get(final_ratio_key, 0)) + 1
     if state["switches"]:
         statistics["adaptive_questions_with_switch"] += 1
+    if state["layer_switches"]:
+        statistics["adaptive_layer_questions_with_switch"] += 1
 
     total_draft_tokens = max(0, int(total_draft_tokens))
     total_accepted_tokens = max(0, int(total_accepted_tokens))
@@ -320,6 +456,9 @@ def _finish_local_adaptive_sample(statistics, state, total_accepted_tokens, tota
         "final_ratio": final_ratio,
         "switch_count": len(state["switches"]),
         "switches": state["switches"],
+        "layer_switch_count": len(state["layer_switches"]),
+        "layer_switches": state["layer_switches"],
+        "final_attn_skip_count": int(statistics.get("cosine_current_attn_skip_count", 0)),
         "ratio_step_counts": {},
         "sample_acceptance": float(sample_acceptance),
     }
@@ -457,6 +596,7 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
     swift_logits, sample_token, top1_prob = initialize_swift(input_ids, model, max_new_tokens,
                                                              past_key_values, past_key_values_data,
                                                              current_length_data, logits_processor=logits_processor,
+                                                             statistics=statistics,
                                                              draft_token_num=fixed_draft_token_num)
 
     # Clone the prefilled past key and value states for swift optimization
@@ -905,6 +1045,67 @@ if __name__ == "__main__":
         help="Number of layer-only refinement probes after the final retain ratio is selected.",
     )
     parser.add_argument(
+        "--cosine-prefill-skip-layers",
+        action="store_true",
+        default=False,
+        help="Choose draft skip layers from attention cosine similarity collected during the normal prefill.",
+    )
+    parser.add_argument(
+        "--cosine-skip-mode",
+        type=str,
+        default="topk",
+        choices=["topk", "threshold"],
+        help="Use cosine ranking by skip budget or thresholding for prefill skip-layer selection.",
+    )
+    parser.add_argument(
+        "--cosine-attn-alpha",
+        type=float,
+        default=0.985,
+        help="Attention cosine threshold used when --cosine-skip-mode threshold is selected.",
+    )
+    parser.add_argument(
+        "--cosine-max-skip-layers",
+        type=int,
+        default=None,
+        help="Maximum number of attention layers to skip in cosine mode. Defaults to skip_ratio times eligible attention layers.",
+    )
+    parser.add_argument(
+        "--cosine-keep-first-layers",
+        type=int,
+        default=1,
+        help="Number of initial layers that cosine skip selection must preserve.",
+    )
+    parser.add_argument(
+        "--cosine-keep-last-layers",
+        type=int,
+        default=2,
+        help="Number of final layers that cosine skip selection must preserve.",
+    )
+    parser.add_argument(
+        "--cosine-mlp-interval",
+        type=int,
+        default=0,
+        help="Optionally skip every m-th MLP layer in cosine mode. 0 disables MLP skipping.",
+    )
+    parser.add_argument(
+        "--adaptive-layer-controller",
+        action="store_true",
+        default=False,
+        help="After an upward retain-ratio switch, restore one cosine-ranked attention layer if acceptance does not improve.",
+    )
+    parser.add_argument(
+        "--adaptive-layer-fallback-window",
+        type=int,
+        default=16,
+        help="Number of SWIFT decoding steps to wait after a ratio increase before restoring one skipped layer.",
+    )
+    parser.add_argument(
+        "--adaptive-layer-improvement-delta",
+        type=float,
+        default=0.0,
+        help="Minimum acceptance improvement required after a ratio increase to avoid restoring one skipped layer.",
+    )
+    parser.add_argument(
         "--optimize-with-compressed-draft-kv",
         dest="optimize_with_compressed_draft_kv",
         action="store_true",
@@ -1061,6 +1262,20 @@ if __name__ == "__main__":
         parser.error("--adaptive-patience must be a positive integer.")
     if args.adaptive_cooldown < 0:
         parser.error("--adaptive-cooldown must be non-negative.")
+    if args.cosine_attn_alpha < -1.0 or args.cosine_attn_alpha > 1.0:
+        parser.error("--cosine-attn-alpha must be in the range [-1, 1].")
+    if args.cosine_max_skip_layers is not None and args.cosine_max_skip_layers < 0:
+        parser.error("--cosine-max-skip-layers must be non-negative when set.")
+    if args.cosine_keep_first_layers < 0:
+        parser.error("--cosine-keep-first-layers must be non-negative.")
+    if args.cosine_keep_last_layers < 0:
+        parser.error("--cosine-keep-last-layers must be non-negative.")
+    if args.cosine_mlp_interval < 0:
+        parser.error("--cosine-mlp-interval must be non-negative.")
+    if args.adaptive_layer_fallback_window <= 0:
+        parser.error("--adaptive-layer-fallback-window must be a positive integer.")
+    if args.adaptive_layer_improvement_delta < 0.0:
+        parser.error("--adaptive-layer-improvement-delta must be non-negative.")
     try:
         args.retain_ratio_grid_values = parse_retain_ratio_grid(
             args.retain_ratio_grid,
@@ -1091,6 +1306,16 @@ if __name__ == "__main__":
         parser.error("--dynamic-retain-ratio requires --optimize-with-compressed-draft-kv.")
     if args.dynamic_retain_ratio and (args.load_skip_layer_cache or args.cache_hit):
         parser.error("--dynamic-retain-ratio cannot be combined with cached skip-layer loading.")
+    if args.cosine_prefill_skip_layers and args.dynamic_retain_ratio:
+        parser.error("--cosine-prefill-skip-layers is intended to replace dynamic retain-ratio search in this path.")
+    if args.cosine_prefill_skip_layers and args.draft_only:
+        parser.error("--cosine-prefill-skip-layers is not supported with --draft-only.")
+    if args.cosine_prefill_skip_layers and args.optimization:
+        parser.error("--cosine-prefill-skip-layers cannot be combined with --optimization trials.")
+    if args.adaptive_layer_controller and not args.local_adaptive_controller:
+        parser.error("--adaptive-layer-controller requires --local-adaptive-controller.")
+    if args.adaptive_layer_controller and not args.cosine_prefill_skip_layers:
+        parser.error("--adaptive-layer-controller requires --cosine-prefill-skip-layers.")
     if args.save_skip_layer_cache and args.load_skip_layer_cache:
         parser.error("--save-skip-layer-cache and --load-skip-layer-cache are mutually exclusive.")
     if args.load_selected_swift_config:
@@ -1105,8 +1330,8 @@ if __name__ == "__main__":
             parser.error("--local-adaptive-controller is not supported with --draft-only.")
         if not args.draft_kv_compress:
             parser.error("--local-adaptive-controller requires --draft-kv-compress.")
-        if not args.dynamic_retain_ratio and not args.load_selected_swift_config:
-            parser.error("--local-adaptive-controller requires either --dynamic-retain-ratio or --load-selected-swift-config.")
+        if not (args.dynamic_retain_ratio or args.load_selected_swift_config or args.cosine_prefill_skip_layers):
+            parser.error("--local-adaptive-controller requires dynamic retain-ratio, selected config, or cosine prefill skip layers.")
 
     selected_swift_config = None
     if args.load_selected_swift_config:
@@ -1136,11 +1361,13 @@ if __name__ == "__main__":
     args.skip_layer_cache_key = args.skip_layer_cache_key or build_skip_layer_cache_key(args)
 
     retain_ratio_name = retain_ratio_run_name(args)
+    cosine_name_suffix = ""
     args.model_name = (args.model_id + "-swift-" + str(args.dtype)+ "-temp-" + str(args.temperature)
                        + "-top-p-" + str(args.top_p) + "-seed-" + str(args.seed) + "-max_new_tokens-" + str(args.max_new_tokens)+ "-opt_interval-" + str(args.opt_interval)
                     #    + "-bayes_interval-" + str(args.bayes_interval) + "-max_opt-" + str(args.max_opt_iter) + "-max_tolerance-" + str(args.max_tolerance_iter)
                        + "-max_score-" + str(args.max_score) + "-context_window-" + str(args.context_window) + "-skip_ratio-" + str(args.skip_ratio) + "-draft_kv_retain_ratio-" + retain_ratio_name
                        + "-opt_compressed_draft_kv-" + str(args.optimize_with_compressed_draft_kv)
+                       + cosine_name_suffix
                        + ("-draft_token_num-" + str(args.draft_token_num) if args.draft_token_num is not None else "")
                        + ("-draft_only" if args.draft_only else ""))
     answer_file = args.answer_file or f"outputs/{args.task_name}/{args.task_name}_{args.data_num}/without_layerskip_draft_model_answer/{args.model_id}/{args.model_name}.jsonl"
@@ -1211,6 +1438,16 @@ if __name__ == "__main__":
                   "draft_kv_compress": args.draft_kv_compress, "draft_kv_retain_ratio": args.draft_kv_retain_ratio,
                   "optimize_with_compressed_draft_kv": args.optimize_with_compressed_draft_kv,
                   "draft_token_num": args.draft_token_num,
+                  "cosine_prefill_skip_layers": args.cosine_prefill_skip_layers,
+                  "cosine_skip_mode": args.cosine_skip_mode,
+                  "cosine_attn_alpha": args.cosine_attn_alpha,
+                  "cosine_max_skip_layers": args.cosine_max_skip_layers,
+                  "cosine_keep_first_layers": args.cosine_keep_first_layers,
+                  "cosine_keep_last_layers": args.cosine_keep_last_layers,
+                  "cosine_mlp_interval": args.cosine_mlp_interval,
+                  "adaptive_layer_controller": args.adaptive_layer_controller,
+                  "adaptive_layer_fallback_window": args.adaptive_layer_fallback_window,
+                  "adaptive_layer_improvement_delta": args.adaptive_layer_improvement_delta,
                   "dynamic_retain_ratio": args.dynamic_retain_ratio,
                   "retain_ratio_grid": args.retain_ratio_grid_values,
                   "retain_target_score": args.retain_target_score,

@@ -312,6 +312,14 @@ class LlamaDecoderLayer(nn.Module):
                 )
 
                 hidden_states = residual + hidden_states
+                if getattr(self, "collect_attn_cosine", False) and not enabled_draft:
+                    self.last_attn_cosine = F.cosine_similarity(
+                        residual.detach().float(),
+                        hidden_states.detach().float(),
+                        dim=-1,
+                        eps=1e-6,
+                    ).mean().detach()
+
 
             # Fully Connected
             residual = hidden_states
