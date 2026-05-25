@@ -156,11 +156,53 @@ def clean_mmlu_output(output_text):
     return cleaned
 
 
+SAMSUM_STOP_PATTERNS = [
+    r"<\|(?:eot_id|end_of_text|start_header_id|end_header_id)\|>",
+]
+
+SAMSUM_TRIM_PATTERNS = SAMSUM_STOP_PATTERNS + [
+    r"<\|[^>]+\|>",
+    r"\n\s*(?:dialogue|user|assistant)\s*[:：]",
+]
+
+SAMSUM_PREFIX_PATTERNS = [
+    r"^(?:sure[,.]?\s*)?here\s+(?:is|is\s+a|is\s+the|is\s+an)\s+(?:concise\s+)?summary(?:\s+of\s+the\s+dialogue)?\s*[:：-]\s*",
+    r"^(?:sure[,.]?\s*)?(?:a\s+)?(?:concise\s+)?summary(?:\s+of\s+the\s+dialogue)?\s*[:：-]\s*",
+]
+
+
+def clean_samsum_output(output_text):
+    cleaned = output_text.strip()
+    first_match = None
+    for pattern in SAMSUM_TRIM_PATTERNS:
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE | re.DOTALL)
+        if match and (first_match is None or match.start() < first_match.start()):
+            first_match = match
+    if first_match:
+        cleaned = cleaned[: first_match.start()].strip()
+
+    cleaned = re.sub(r"<\|[^>]+\|>", " ", cleaned)
+
+    previous = None
+    while previous != cleaned:
+        previous = cleaned
+        for pattern in SAMSUM_PREFIX_PATTERNS:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE | re.DOTALL).strip()
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
 def get_generation_stop_config(task_name):
     task_name = normalize_task_name(task_name)
     if task_name == "mmlu":
         return {
             "patterns": MMLU_TRIM_PATTERNS,
+            "min_chars_before_match": 0,
+        }
+    if task_name == "samsum":
+        return {
+            "patterns": SAMSUM_STOP_PATTERNS,
             "min_chars_before_match": 0,
         }
     if is_qa_task(task_name):
@@ -385,7 +427,8 @@ def clip_input(
                     "role": "user",
                     "content": (
                         "Summarize the following dialogue in one concise paragraph. "
-                        "Provide only the summary.\n\n"
+                        "Start directly with the summary. Do not include labels, preambles, "
+                        "or another assistant turn.\n\n"
                         f"Dialogue:\n{dialogue}"
                     ),
                 },
@@ -397,7 +440,8 @@ def clip_input(
         else:
             prompt_text = (
                 prompt_shots
-                + "Summarize the following dialogue in one concise paragraph.\n\n"
+                + "Summarize the following dialogue in one concise paragraph. "
+                + "Start directly with the summary.\n\n"
                 + f"Dialogue:\n{dialogue}\nSummary:"
             )
             end_prompt = "\nSummary:"
@@ -464,7 +508,7 @@ def clip_input(
             + "Choose the best answer and provide a concise explanation. "
             + "Respond in exactly this format:\n"
             + "Answer: <A, B, C, or D>\n"
-            + "Explanation: <brief explanation>\n\n"
+            + "Explanation: <2-3 concise sentences. Do not repeat the question or choices.>\n\n"
             + f"Question: {prompt['question'].strip()}\n"
             + f"A. {choices[0]}\n"
             + f"B. {choices[1]}\n"
@@ -897,6 +941,8 @@ def get_model_answers(
             raw_output = output
             if task_name == "mmlu":
                 output = clean_mmlu_output(output)
+            elif task_name == "samsum":
+                output = clean_samsum_output(output)
             elif is_qa_task(task_name):
                 output = clean_qa_output(output)
 
@@ -920,7 +966,7 @@ def get_model_answers(
             "accept_lengths": cur_accept_lengths_tree,
             "acceptance_rate": sample_acceptance_rate,
         }
-        if task_name == "mmlu" and raw_output != output:
+        if task_name in {"mmlu", "samsum"} and raw_output != output:
             sample_record["raw_turns"] = raw_output
         runtime_statistics = forward_kwargs.get("statistics")
         if runtime_statistics and runtime_statistics.get("local_adaptive_controller"):
@@ -1110,7 +1156,17 @@ def get_model_answers(
         summary["Adaptive Layer Fallback Window"] = int(runtime_statistics.get("adaptive_layer_fallback_window", 16))
         summary["Adaptive Layer Improvement Delta"] = float(runtime_statistics.get("adaptive_layer_improvement_delta", 0.0))
         summary["Adaptive Layer Total Switches"] = int(runtime_statistics.get("adaptive_layer_total_switches", 0))
+        summary["Adaptive Less-Skip Switches"] = int(runtime_statistics.get("adaptive_less_skip_total_switches", 0))
+        summary["Adaptive More-Skip Switches"] = int(runtime_statistics.get("adaptive_more_skip_total_switches", 0))
         summary["Adaptive Layer Questions With Switch"] = int(runtime_statistics.get("adaptive_layer_questions_with_switch", 0))
+        summary["Adaptive Aggressive Controller"] = bool(runtime_statistics.get("adaptive_aggressive_controller", False))
+        summary["Adaptive Min Retain Ratio"] = float(runtime_statistics.get("adaptive_min_retain_ratio", 0.1))
+        summary["Adaptive Ratio Step"] = float(runtime_statistics.get("adaptive_ratio_step", 0.1))
+        summary["Adaptive Aggressive Tolerance"] = float(runtime_statistics.get("adaptive_aggressive_tolerance", 0.02))
+        summary["Adaptive Aggressive Std K"] = float(runtime_statistics.get("adaptive_aggressive_std_k", 0.5))
+        summary["Adaptive Aggressive Patience"] = int(runtime_statistics.get("adaptive_aggressive_patience", 1))
+        summary["Adaptive Max Extra Skip Layers"] = runtime_statistics.get("adaptive_max_extra_skip_layers")
+        summary["Adaptive Aggressive Ratio Down Switches"] = int(runtime_statistics.get("adaptive_aggressive_ratio_down_switches", 0))
         summary["Adaptive Question Count"] = int(runtime_statistics.get("adaptive_question_count", 0))
         summary["Adaptive Questions With Switch"] = int(runtime_statistics.get("adaptive_questions_with_switch", 0))
         summary["Adaptive Ratio Step Counts"] = runtime_statistics.get("adaptive_ratio_step_counts", {})
@@ -1133,12 +1189,12 @@ def get_model_answers(
         summary["ROUGE-L"] = total_rougeL / total_rouge_scored
         summary["Total ROUGE Scored"] = total_rouge_scored
 
-    if task_name == "mt_bench":
-        summary = {
-            "question_id": "__summary__",
-            "task_name": task_name,
-            **summary,
-        }
+    summary = {
+        "question_index": "__summary__",
+        "question_id": "__summary__",
+        "task_name": task_name,
+        **summary,
+    }
 
     with open(os.path.expanduser(answer_file), "a", encoding="utf-8") as fout:
         fout.write(json.dumps(summary, ensure_ascii=False) + "\n")

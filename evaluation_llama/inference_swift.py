@@ -49,11 +49,26 @@ def format_retain_ratio_grid(retain_ratios):
     return ",".join(str(float(retain_ratio)) for retain_ratio in retain_ratios)
 
 
+def extend_aggressive_adaptive_ratio_ladder(retain_ratios, min_ratio=0.1, step=0.1):
+    values = [float(retain_ratio) for retain_ratio in retain_ratios]
+    min_ratio = float(min_ratio)
+    step = float(step)
+    current = min_ratio
+    while current <= 1.0 + 1e-9:
+        rounded = round(current, 10)
+        if not any(abs(rounded - existing) < 1e-9 for existing in values):
+            values.append(rounded)
+        current += step
+    return sorted(values)
+
+
 def retain_ratio_run_name(args):
     if getattr(args, "local_adaptive_controller", False):
         if getattr(args, "dynamic_retain_ratio", False):
             return "dynamic3"
         if getattr(args, "cosine_prefill_skip_layers", False):
+            if getattr(args, "adaptive_aggressive_controller", False):
+                return "dynamic-4-aggressive"
             return "dynamic-4"
         if getattr(args, "load_selected_swift_config", False):
             return "selected-config-adaptive"
@@ -114,6 +129,9 @@ def _initialize_local_adaptive_state(statistics, model):
     statistics.setdefault("adaptive_final_ratio_counts", {})
     statistics.setdefault("adaptive_layer_total_switches", 0)
     statistics.setdefault("adaptive_layer_questions_with_switch", 0)
+    statistics.setdefault("adaptive_less_skip_total_switches", 0)
+    statistics.setdefault("adaptive_more_skip_total_switches", 0)
+    statistics.setdefault("adaptive_aggressive_ratio_down_switches", 0)
     statistics.setdefault("adaptive_global_accepted_tokens", 0)
     statistics.setdefault("adaptive_global_draft_tokens", 0)
     statistics.setdefault("adaptive_global_step_acceptance_history", [])
@@ -135,6 +153,8 @@ def _initialize_local_adaptive_state(statistics, model):
         "pending_ratio_probe": None,
         "low_streak": 0,
         "high_streak": 0,
+        "aggressive_stable_streak": 0,
+        "aggressive_extra_skip_count": 0,
         "cooldown": 0,
     }
 
@@ -195,10 +215,15 @@ def _set_local_adaptive_ratio(statistics, model, state, new_level, step_idx, dir
     state["current_ratio"] = new_ratio
     state["low_streak"] = 0
     state["high_streak"] = 0
+    state["aggressive_stable_streak"] = 0
     state["cooldown"] = int(statistics.get("adaptive_cooldown", 0))
     model.draft_kv_retain_ratio = new_ratio
     statistics["adaptive_current_ratio"] = new_ratio
     statistics["adaptive_total_switches"] += 1
+    if direction == "down_aggressive":
+        statistics["adaptive_aggressive_ratio_down_switches"] = int(
+            statistics.get("adaptive_aggressive_ratio_down_switches", 0)
+        ) + 1
 
     switch = {
         "step": int(step_idx),
@@ -272,6 +297,12 @@ def _reduce_one_cosine_skip_layer(statistics, model, state, step_idx, reason,
     statistics["adaptive_layer_total_switches"] = int(
         statistics.get("adaptive_layer_total_switches", 0)
     ) + 1
+    statistics["adaptive_less_skip_total_switches"] = int(
+        statistics.get("adaptive_less_skip_total_switches", 0)
+    ) + 1
+    state["aggressive_extra_skip_count"] = max(
+        0, int(state.get("aggressive_extra_skip_count", 0)) - 1
+    )
 
     switch = {
         "step": int(step_idx),
@@ -291,11 +322,84 @@ def _reduce_one_cosine_skip_layer(statistics, model, state, step_idx, reason,
     state["pending_ratio_probe"] = None
     state["low_streak"] = 0
     state["high_streak"] = 0
+    state["aggressive_stable_streak"] = 0
     state["cooldown"] = int(statistics.get("adaptive_cooldown", 0))
     logging.info(
         "Local adaptive layer less_skip: restored attn layer %s (cosine %.4f), skip_count %s -> %s",
         layer_to_restore,
         switch["restored_attn_layer_cosine"],
+        len(attn_skip_layers),
+        len(new_attn_skip_layers),
+    )
+    return True
+
+
+def _increase_one_cosine_skip_layer(statistics, model, state, step_idx, reason,
+                                    window_acceptance=None, reference_acceptance=None):
+    if not _adaptive_layer_controller_enabled(statistics):
+        return False
+
+    max_extra_skip_layers = statistics.get("adaptive_max_extra_skip_layers")
+    if max_extra_skip_layers is not None:
+        if int(state.get("aggressive_extra_skip_count", 0)) >= int(max_extra_skip_layers):
+            return False
+
+    attn_skip_layers, mlp_skip_layers = model.get_skip_layers()
+    attn_skip_layers = [int(layer_id) for layer_id in list(attn_skip_layers)]
+    mlp_skip_layers = [int(layer_id) for layer_id in list(mlp_skip_layers)]
+    skipped = set(attn_skip_layers)
+
+    ranked_layers = statistics.get("cosine_attn_ranking") or []
+    if not ranked_layers:
+        eligible_layers = statistics.get("cosine_attn_eligible_layers") or list(range(len(statistics.get("cosine_attn_scores", []))))
+        ranked_layers = sorted(
+            [int(layer_id) for layer_id in eligible_layers],
+            key=lambda layer_id: (-_cosine_score_for_layer(statistics, layer_id), int(layer_id)),
+        )
+
+    candidates = [int(layer_id) for layer_id in ranked_layers if int(layer_id) not in skipped]
+    if not candidates:
+        return False
+
+    layer_to_skip = candidates[0]
+    new_attn_skip_layers = sorted(attn_skip_layers + [layer_to_skip])
+    model.set_skip_layers(new_attn_skip_layers, mlp_skip_layers)
+
+    statistics["cosine_attn_skip_layers"] = [int(layer_id) for layer_id in new_attn_skip_layers]
+    statistics["cosine_current_attn_skip_count"] = len(new_attn_skip_layers)
+    statistics["adaptive_layer_total_switches"] = int(
+        statistics.get("adaptive_layer_total_switches", 0)
+    ) + 1
+    statistics["adaptive_more_skip_total_switches"] = int(
+        statistics.get("adaptive_more_skip_total_switches", 0)
+    ) + 1
+    state["aggressive_extra_skip_count"] = int(state.get("aggressive_extra_skip_count", 0)) + 1
+
+    switch = {
+        "step": int(step_idx),
+        "direction": "more_skip",
+        "reason": reason,
+        "skipped_attn_layer": int(layer_to_skip),
+        "skipped_attn_layer_cosine": float(_cosine_score_for_layer(statistics, layer_to_skip)),
+        "old_attn_skip_count": int(len(attn_skip_layers)),
+        "new_attn_skip_count": int(len(new_attn_skip_layers)),
+        "aggressive_extra_skip_count": int(state.get("aggressive_extra_skip_count", 0)),
+    }
+    if window_acceptance is not None:
+        switch["window_acceptance"] = float(window_acceptance)
+    if reference_acceptance is not None:
+        switch["reference_acceptance"] = float(reference_acceptance)
+
+    state["layer_switches"].append(switch)
+    state["pending_ratio_probe"] = None
+    state["low_streak"] = 0
+    state["high_streak"] = 0
+    state["aggressive_stable_streak"] = 0
+    state["cooldown"] = int(statistics.get("adaptive_cooldown", 0))
+    logging.info(
+        "Local adaptive layer more_skip: skipped attn layer %s (cosine %.4f), skip_count %s -> %s",
+        layer_to_skip,
+        switch["skipped_attn_layer_cosine"],
         len(attn_skip_layers),
         len(new_attn_skip_layers),
     )
@@ -377,9 +481,17 @@ def _update_local_adaptive_controller(
                 upper_threshold = reference_acceptance + down_std_k * effective_std
                 patience = max(1, int(statistics.get("adaptive_patience", 1)))
 
+                aggressive_enabled = bool(statistics.get("adaptive_aggressive_controller", False))
+                aggressive_tolerance = max(0.0, float(statistics.get("adaptive_aggressive_tolerance", 0.02)))
+                aggressive_std_k = max(0.0, float(statistics.get("adaptive_aggressive_std_k", 0.5)))
+                no_regression_delta = max(aggressive_tolerance, aggressive_std_k * effective_std)
+                no_regression_threshold = reference_acceptance - no_regression_delta
+                aggressive_patience = max(1, int(statistics.get("adaptive_aggressive_patience", patience)))
+
                 if window_acceptance < lower_threshold:
                     state["low_streak"] += 1
                     state["high_streak"] = 0
+                    state["aggressive_stable_streak"] = 0
                     if state["low_streak"] >= patience:
                         if state["level"] < len(state["ladder"]) - 1:
                             _set_local_adaptive_ratio(
@@ -408,9 +520,42 @@ def _update_local_adaptive_controller(
                                 window_acceptance=window_acceptance,
                                 reference_acceptance=reference_acceptance,
                             )
+                elif aggressive_enabled and window_acceptance >= no_regression_threshold:
+                    state["aggressive_stable_streak"] += 1
+                    state["low_streak"] = 0
+                    state["high_streak"] = 0
+                    if state["aggressive_stable_streak"] >= aggressive_patience:
+                        if state["level"] > 0:
+                            _set_local_adaptive_ratio(
+                                statistics,
+                                model,
+                                state,
+                                state["level"] - 1,
+                                step_idx,
+                                "down_aggressive",
+                                window_acceptance,
+                                reference_acceptance,
+                                effective_std,
+                                no_regression_threshold,
+                                upper_threshold,
+                                reference_observations,
+                                up_std_k,
+                                down_std_k,
+                            )
+                        else:
+                            _increase_one_cosine_skip_layer(
+                                statistics,
+                                model,
+                                state,
+                                step_idx,
+                                "stable_acceptance_at_min_ratio",
+                                window_acceptance=window_acceptance,
+                                reference_acceptance=reference_acceptance,
+                            )
                 elif window_acceptance > upper_threshold:
                     state["high_streak"] += 1
                     state["low_streak"] = 0
+                    state["aggressive_stable_streak"] = 0
                     if state["high_streak"] >= patience and state["level"] > 0:
                         _set_local_adaptive_ratio(
                             statistics,
@@ -431,6 +576,7 @@ def _update_local_adaptive_controller(
                 else:
                     state["low_streak"] = 0
                     state["high_streak"] = 0
+                    state["aggressive_stable_streak"] = 0
 
     _record_local_adaptive_global_step(statistics, accepted_tokens, drafted_tokens, step_acceptance)
 
@@ -459,6 +605,7 @@ def _finish_local_adaptive_sample(statistics, state, total_accepted_tokens, tota
         "layer_switch_count": len(state["layer_switches"]),
         "layer_switches": state["layer_switches"],
         "final_attn_skip_count": int(statistics.get("cosine_current_attn_skip_count", 0)),
+        "aggressive_extra_skip_count": int(state.get("aggressive_extra_skip_count", 0)),
         "ratio_step_counts": {},
         "sample_acceptance": float(sample_acceptance),
     }
@@ -1106,6 +1253,48 @@ if __name__ == "__main__":
         help="Minimum acceptance improvement required after a ratio increase to avoid restoring one skipped layer.",
     )
     parser.add_argument(
+        "--adaptive-aggressive-controller",
+        action="store_true",
+        default=False,
+        help="When local acceptance does not clearly regress, lower retain ratio and then add cosine-ranked skip layers.",
+    )
+    parser.add_argument(
+        "--adaptive-min-retain-ratio",
+        type=float,
+        default=0.1,
+        help="Lowest retain ratio added to the local adaptive ladder when aggressive control is enabled.",
+    )
+    parser.add_argument(
+        "--adaptive-ratio-step",
+        type=float,
+        default=0.1,
+        help="Step used to fill the aggressive local adaptive ratio ladder down to --adaptive-min-retain-ratio.",
+    )
+    parser.add_argument(
+        "--adaptive-aggressive-tolerance",
+        type=float,
+        default=0.02,
+        help="Allowed acceptance drop before aggressive down-shifts are considered unsafe.",
+    )
+    parser.add_argument(
+        "--adaptive-aggressive-std-k",
+        type=float,
+        default=0.5,
+        help="Running-std multiplier used with --adaptive-aggressive-tolerance for no-regression checks.",
+    )
+    parser.add_argument(
+        "--adaptive-aggressive-patience",
+        type=int,
+        default=1,
+        help="Consecutive no-regression windows required before lowering ratio or adding a skip layer.",
+    )
+    parser.add_argument(
+        "--adaptive-max-extra-skip-layers",
+        type=int,
+        default=None,
+        help="Optional cap on extra attention layers skipped by aggressive control within one question.",
+    )
+    parser.add_argument(
         "--optimize-with-compressed-draft-kv",
         dest="optimize_with_compressed_draft_kv",
         action="store_true",
@@ -1276,6 +1465,18 @@ if __name__ == "__main__":
         parser.error("--adaptive-layer-fallback-window must be a positive integer.")
     if args.adaptive_layer_improvement_delta < 0.0:
         parser.error("--adaptive-layer-improvement-delta must be non-negative.")
+    if args.adaptive_min_retain_ratio <= 0.0 or args.adaptive_min_retain_ratio > 1.0:
+        parser.error("--adaptive-min-retain-ratio must be in the range (0, 1].")
+    if args.adaptive_ratio_step <= 0.0 or args.adaptive_ratio_step > 1.0:
+        parser.error("--adaptive-ratio-step must be in the range (0, 1].")
+    if args.adaptive_aggressive_tolerance < 0.0:
+        parser.error("--adaptive-aggressive-tolerance must be non-negative.")
+    if args.adaptive_aggressive_std_k < 0.0:
+        parser.error("--adaptive-aggressive-std-k must be non-negative.")
+    if args.adaptive_aggressive_patience <= 0:
+        parser.error("--adaptive-aggressive-patience must be a positive integer.")
+    if args.adaptive_max_extra_skip_layers is not None and args.adaptive_max_extra_skip_layers < 0:
+        parser.error("--adaptive-max-extra-skip-layers must be non-negative when set.")
     try:
         args.retain_ratio_grid_values = parse_retain_ratio_grid(
             args.retain_ratio_grid,
@@ -1316,6 +1517,8 @@ if __name__ == "__main__":
         parser.error("--adaptive-layer-controller requires --local-adaptive-controller.")
     if args.adaptive_layer_controller and not args.cosine_prefill_skip_layers:
         parser.error("--adaptive-layer-controller requires --cosine-prefill-skip-layers.")
+    if args.adaptive_aggressive_controller and not args.local_adaptive_controller:
+        parser.error("--adaptive-aggressive-controller requires --local-adaptive-controller.")
     if args.save_skip_layer_cache and args.load_skip_layer_cache:
         parser.error("--save-skip-layer-cache and --load-skip-layer-cache are mutually exclusive.")
     if args.load_selected_swift_config:
@@ -1356,6 +1559,12 @@ if __name__ == "__main__":
         )
     except ValueError as exc:
         parser.error(str(exc))
+    if args.adaptive_aggressive_controller:
+        args.adaptive_ratio_ladder_values = extend_aggressive_adaptive_ratio_ladder(
+            args.adaptive_ratio_ladder_values,
+            min_ratio=args.adaptive_min_retain_ratio,
+            step=args.adaptive_ratio_step,
+        )
     args.adaptive_ratio_ladder = format_retain_ratio_grid(args.adaptive_ratio_ladder_values)
 
     args.skip_layer_cache_key = args.skip_layer_cache_key or build_skip_layer_cache_key(args)
@@ -1448,6 +1657,13 @@ if __name__ == "__main__":
                   "adaptive_layer_controller": args.adaptive_layer_controller,
                   "adaptive_layer_fallback_window": args.adaptive_layer_fallback_window,
                   "adaptive_layer_improvement_delta": args.adaptive_layer_improvement_delta,
+                  "adaptive_aggressive_controller": args.adaptive_aggressive_controller,
+                  "adaptive_min_retain_ratio": args.adaptive_min_retain_ratio,
+                  "adaptive_ratio_step": args.adaptive_ratio_step,
+                  "adaptive_aggressive_tolerance": args.adaptive_aggressive_tolerance,
+                  "adaptive_aggressive_std_k": args.adaptive_aggressive_std_k,
+                  "adaptive_aggressive_patience": args.adaptive_aggressive_patience,
+                  "adaptive_max_extra_skip_layers": args.adaptive_max_extra_skip_layers,
                   "dynamic_retain_ratio": args.dynamic_retain_ratio,
                   "retain_ratio_grid": args.retain_ratio_grid_values,
                   "retain_target_score": args.retain_target_score,
