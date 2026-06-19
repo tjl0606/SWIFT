@@ -13,6 +13,7 @@ import torch
 import random
 import numpy as np
 import re
+from decimal import Decimal, InvalidOperation
 
 from collections import Counter
 from tqdm import tqdm
@@ -33,6 +34,37 @@ def seed_everything(seed=64):
 def safe_cuda_synchronize():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def summarize_adaptive_step_config_stats(config_stats):
+    rows = []
+    for key, entry in (config_stats or {}).items():
+        step_count = int(entry.get("step_count", 0))
+        accepted_tokens = int(entry.get("accepted_tokens", 0))
+        drafted_tokens = int(entry.get("drafted_tokens", 0))
+        mean_accepted_std = 0.0
+        if step_count > 1:
+            mean_accepted_std = (max(0.0, float(entry.get("mean_accepted_step_m2", 0.0)) / (step_count - 1))) ** 0.5
+        rows.append({
+            "config_key": key,
+            "current_ratio": float(entry.get("current_ratio", 0.0)),
+            "current_attn_skip_count": int(entry.get("current_attn_skip_count", 0)),
+            "step_count": step_count,
+            "accepted_tokens": accepted_tokens,
+            "drafted_tokens": drafted_tokens,
+            "mean_accepted_tokens": (
+                (accepted_tokens + step_count) / step_count if step_count > 0 else 0.0
+            ),
+            "mean_accepted_tokens_std": mean_accepted_std,
+            "mean_accepted_draft_tokens": (
+                accepted_tokens / step_count if step_count > 0 else 0.0
+            ),
+            "token_acceptance_rate": (
+                accepted_tokens / drafted_tokens if drafted_tokens > 0 else 0.0
+            ),
+        })
+    rows.sort(key=lambda row: (row["current_ratio"], row["current_attn_skip_count"]))
+    return rows
 
 
 def normalize_task_name(task_name):
@@ -76,8 +108,58 @@ GSM8K_ANSWER_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
+GSM8K_STOP_PATTERNS = [
+    # Do not stop on end-of-buffer after a number during incremental decoding:
+    # a SWIFT step can end mid-answer, e.g. "$143" before the next token "0".
+    r"\bthe\s+answer\s+is\s+\$?-?\d[\d,]*(?:\.\d+)?\s*(?:\.(?!\d)|\n)",
+    r"\bfinal\s+answer\s*[:：]\s*(?:the\s+answer\s+is\s*)?\$?-?\d[\d,]*(?:\.\d+)?\s*(?:\.(?!\d)|\n)",
+    r"<\|(?:eot_id|end_of_text|start_header_id|end_header_id)\|>",
+]
+
+GSM8K_TRIM_PATTERNS = [
+    r"<\|[^>]+\|>",
+]
+
+GSM8K_FINAL_SENTENCE_RE = re.compile(
+    r"(?:\bthe\s+answer\s+is\s+\$?-?\d[\d,]*(?:\.\d+)?\s*\.|"
+    r"\bfinal\s+answer\s*[:：]\s*(?:the\s+answer\s+is\s*)?\$?-?\d[\d,]*(?:\.\d+)?\s*\.)",
+    flags=re.IGNORECASE,
+)
+
+
+def clean_gsm8k_output(output_text):
+    cleaned = output_text.strip()
+
+    first_match = None
+    for pattern in GSM8K_TRIM_PATTERNS:
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE | re.DOTALL)
+        if match and (first_match is None or match.start() < first_match.start()):
+            first_match = match
+    if first_match:
+        cleaned = cleaned[: first_match.start()].strip()
+
+    final_match = GSM8K_FINAL_SENTENCE_RE.search(cleaned)
+    if final_match:
+        cleaned = cleaned[: final_match.end()].strip()
+
+    cleaned = re.sub(r"<\|[^>]+\|>", " ", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
 def normalize_number_text(number_text):
     return number_text.replace(",", "")
+
+
+def normalize_gsm8k_answer_number(number_text):
+    if number_text is None:
+        return None
+    normalized = normalize_number_text(str(number_text).strip())
+    try:
+        canonical = format(Decimal(normalized).normalize(), "f")
+    except InvalidOperation:
+        return normalized
+    return "0" if canonical == "-0" else canonical
 
 
 def extract_gsm8k_pred(output_text):
@@ -160,6 +242,14 @@ SAMSUM_STOP_PATTERNS = [
     r"<\|(?:eot_id|end_of_text|start_header_id|end_header_id)\|>",
 ]
 
+MT_BENCH_STOP_PATTERNS = [
+    r"<\|(?:eot_id|end_of_text|start_header_id|end_header_id)\|>",
+]
+
+MT_BENCH_TRIM_PATTERNS = MT_BENCH_STOP_PATTERNS + [
+    r"<\|[^>]+\|>",
+]
+
 SAMSUM_TRIM_PATTERNS = SAMSUM_STOP_PATTERNS + [
     r"<\|[^>]+\|>",
     r"\n\s*(?:dialogue|user|assistant)\s*[:：]",
@@ -193,6 +283,19 @@ def clean_samsum_output(output_text):
     return cleaned
 
 
+def clean_mt_bench_output(output_text):
+    cleaned = output_text.strip()
+    first_match = None
+    for pattern in MT_BENCH_TRIM_PATTERNS:
+        match = re.search(pattern, cleaned, flags=re.IGNORECASE | re.DOTALL)
+        if match and (first_match is None or match.start() < first_match.start()):
+            first_match = match
+    if first_match:
+        cleaned = cleaned[: first_match.start()].strip()
+    cleaned = re.sub(r"<\|[^>]+\|>", " ", cleaned)
+    return cleaned.strip()
+
+
 def get_generation_stop_config(task_name):
     task_name = normalize_task_name(task_name)
     if task_name == "mmlu":
@@ -203,6 +306,16 @@ def get_generation_stop_config(task_name):
     if task_name == "samsum":
         return {
             "patterns": SAMSUM_STOP_PATTERNS,
+            "min_chars_before_match": 0,
+        }
+    if task_name == "gsm8k":
+        return {
+            "patterns": GSM8K_STOP_PATTERNS,
+            "min_chars_before_match": 0,
+        }
+    if task_name == "mt_bench":
+        return {
+            "patterns": MT_BENCH_STOP_PATTERNS,
             "min_chars_before_match": 0,
         }
     if is_qa_task(task_name):
@@ -835,7 +948,7 @@ def get_model_answers(
                             output = output.replace(special_tok, "")
                     else:
                         output = output.replace(special_token, "")
-                output = output.strip()
+                output = clean_mt_bench_output(output)
 
                 turns_outputs.append(output)
                 steps.append(int(step))
@@ -941,6 +1054,8 @@ def get_model_answers(
             raw_output = output
             if task_name == "mmlu":
                 output = clean_mmlu_output(output)
+            elif task_name == "gsm8k":
+                output = clean_gsm8k_output(output)
             elif task_name == "samsum":
                 output = clean_samsum_output(output)
             elif is_qa_task(task_name):
@@ -966,7 +1081,7 @@ def get_model_answers(
             "accept_lengths": cur_accept_lengths_tree,
             "acceptance_rate": sample_acceptance_rate,
         }
-        if task_name in {"mmlu", "samsum"} and raw_output != output:
+        if task_name in {"mmlu", "gsm8k", "samsum"} and raw_output != output:
             sample_record["raw_turns"] = raw_output
         runtime_statistics = forward_kwargs.get("statistics")
         if runtime_statistics and runtime_statistics.get("local_adaptive_controller"):
@@ -983,7 +1098,13 @@ def get_model_answers(
         elif task_name == "gsm8k":
             gold = extract_gsm8k_gold(question["answer"])
             pred = extract_gsm8k_pred(output)
-            sample_correct = (pred is not None and gold is not None and pred == gold)
+            normalized_gold = normalize_gsm8k_answer_number(gold)
+            normalized_pred = normalize_gsm8k_answer_number(pred)
+            sample_correct = (
+                normalized_pred is not None
+                and normalized_gold is not None
+                and normalized_pred == normalized_gold
+            )
 
             sample_record["question"] = question["question"]
             sample_record["gold_answer"] = gold
@@ -1166,11 +1287,91 @@ def get_model_answers(
         summary["Adaptive Aggressive Std K"] = float(runtime_statistics.get("adaptive_aggressive_std_k", 0.5))
         summary["Adaptive Aggressive Patience"] = int(runtime_statistics.get("adaptive_aggressive_patience", 1))
         summary["Adaptive Max Extra Skip Layers"] = runtime_statistics.get("adaptive_max_extra_skip_layers")
+        summary["Adaptive Max Skip Layers"] = runtime_statistics.get("adaptive_max_skip_layers")
         summary["Adaptive Aggressive Ratio Down Switches"] = int(runtime_statistics.get("adaptive_aggressive_ratio_down_switches", 0))
+        summary["Adaptive Final Controller"] = bool(runtime_statistics.get("adaptive_final_controller", False))
+        summary["Final Target Mean Accepted"] = float(runtime_statistics.get("final_target_mean_accepted", 3.0))
+        summary["Final Bad Mean Accepted"] = float(runtime_statistics.get("final_bad_mean_accepted", 2.5))
+        summary["Final Severe Mean Accepted"] = float(runtime_statistics.get("final_severe_mean_accepted", 2.1))
+        summary["Final Token Acceptance Floor"] = float(runtime_statistics.get("final_token_acceptance_floor", 0.85))
+        summary["Final More-Skip Token Acceptance Floor"] = float(runtime_statistics.get("final_more_skip_token_acceptance_floor", 0.90))
+        summary["Final Draft Len Floor"] = float(runtime_statistics.get("final_draft_len_floor", 2.0))
+        summary["Final More-Skip Draft Len Floor"] = float(runtime_statistics.get("final_more_skip_draft_len_floor", 2.2))
+        summary["Final Stable Mean Margin"] = float(runtime_statistics.get("final_stable_mean_margin", 0.1))
+        summary["Final Soft Max Skip Layers"] = int(runtime_statistics.get("final_soft_max_skip_layers", 17))
+        summary["Final Hard Max Skip Layers"] = int(runtime_statistics.get("final_hard_max_skip_layers", 18))
+        summary["Final Min Ratio For More-Skip"] = float(runtime_statistics.get("final_min_ratio_for_more_skip", 0.4))
+        summary["Final Low Ratio Guard"] = float(runtime_statistics.get("final_low_ratio_guard", 0.2))
+        summary["Final Low Ratio Guard Skip Layers"] = int(runtime_statistics.get("final_low_ratio_guard_skip_layers", 17))
+        summary["Final Hard Layer Mean Floor"] = float(runtime_statistics.get("final_hard_layer_mean_floor", 2.8))
+        summary["Final Hard Probe Mean Margin"] = float(runtime_statistics.get("final_hard_probe_mean_margin", 0.5))
+        summary["Final Hard Probe Token Acceptance Floor"] = float(runtime_statistics.get("final_hard_probe_token_acceptance_floor", 0.92))
+        summary["Final Hard Probe Draft Len Margin"] = float(runtime_statistics.get("final_hard_probe_draft_len_margin", 0.3))
+        summary["Final Ratio Down Gain Weight"] = float(runtime_statistics.get("final_ratio_down_gain_weight", 1.0))
+        summary["Final Layer Skip Gain Weight"] = float(runtime_statistics.get("final_layer_skip_gain_weight", 3.0))
+        summary["Final Controller Action Counts"] = runtime_statistics.get("adaptive_final_controller_action_counts", {})
+        summary["Adaptive Final2 Controller"] = bool(runtime_statistics.get("adaptive_final2_controller", False))
+        summary["Final2 Low Std K"] = float(runtime_statistics.get("final2_low_std_k", 0.5))
+        summary["Final2 High Std K"] = float(runtime_statistics.get("final2_high_std_k", 0.5))
+        summary["Final2 Mean Std Floor"] = float(runtime_statistics.get("final2_mean_std_floor", 0.10))
+        summary["Final2 Min Config Observations"] = int(runtime_statistics.get("final2_min_config_observations", 16))
+        summary["Final2 Prediction Beta"] = float(runtime_statistics.get("final2_prediction_beta", 0.5))
+        summary["Final2 Ratio Mean Slope"] = float(runtime_statistics.get("final2_ratio_mean_slope", 1.0))
+        summary["Final2 Layer Mean Slope"] = float(runtime_statistics.get("final2_layer_mean_slope", 0.45))
+        summary["Final2 Cold Start Penalty"] = float(runtime_statistics.get("final2_cold_start_penalty", 0.15))
+        summary["Final2 Token Acceptance Floor"] = float(runtime_statistics.get("final2_token_acceptance_floor", 0.85))
+        summary["Final2 More Aggressive Token Acceptance Floor"] = float(runtime_statistics.get("final2_more_aggressive_token_acceptance_floor", 0.90))
+        summary["Final2 Draft Len Floor"] = float(runtime_statistics.get("final2_draft_len_floor", 2.0))
+        summary["Final2 More Aggressive Draft Len Floor"] = float(runtime_statistics.get("final2_more_aggressive_draft_len_floor", 2.2))
+        summary["Final2 Soft Max Skip Layers"] = int(runtime_statistics.get("final2_soft_max_skip_layers", 18))
+        summary["Final2 Hard Max Skip Layers"] = int(runtime_statistics.get("final2_hard_max_skip_layers", 19))
+        summary["Final2 Min Ratio For More-Skip"] = float(runtime_statistics.get("final2_min_ratio_for_more_skip", 0.4))
+        summary["Final2 Low Ratio Guard"] = float(runtime_statistics.get("final2_low_ratio_guard", 0.2))
+        summary["Final2 Low Ratio Guard Skip Layers"] = int(runtime_statistics.get("final2_low_ratio_guard_skip_layers", 17))
+        summary["Final2 Hard Probe Mean Margin"] = float(runtime_statistics.get("final2_hard_probe_mean_margin", 0.3))
+        summary["Final2 Hard Probe Token Acceptance Floor"] = float(runtime_statistics.get("final2_hard_probe_token_acceptance_floor", 0.92))
+        summary["Final2 Hard Probe Draft Len Margin"] = float(runtime_statistics.get("final2_hard_probe_draft_len_margin", 0.3))
+        summary["Final2 Switch Cost"] = float(runtime_statistics.get("final2_switch_cost", 0.02))
+        summary["Final2 Layer Switch Cost"] = float(runtime_statistics.get("final2_layer_switch_cost", runtime_statistics.get("final2_switch_cost", 0.02)))
+        summary["Final2 Ratio Down Gain Weight"] = float(runtime_statistics.get("final2_ratio_down_gain_weight", 1.0))
+        summary["Final2 Layer Skip Gain Weight"] = float(runtime_statistics.get("final2_layer_skip_gain_weight", 2.0))
+        summary["Final2 Decision Count"] = int(runtime_statistics.get("final2_decision_count", 0))
+        summary["Final2 Keep Decisions"] = int(runtime_statistics.get("final2_keep_decisions", 0))
+        summary["Final2 Controller Action Counts"] = runtime_statistics.get("adaptive_final2_controller_action_counts", {})
+        summary["Final2 Prediction Source Counts"] = runtime_statistics.get("final2_prediction_source_counts", {})
+        summary["Lyapunov Adaptive Controller"] = bool(runtime_statistics.get("lyapunov_adaptive_controller", False))
+        summary["Lyapunov Acceptance Target"] = float(runtime_statistics.get("lyapunov_acceptance_target", 0.92))
+        summary["Lyapunov V"] = float(runtime_statistics.get("lyapunov_v", 0.1))
+        summary["Lyapunov Switch Cost"] = float(runtime_statistics.get("lyapunov_switch_cost", 0.01))
+        summary["Lyapunov Layer Switch Cost"] = float(runtime_statistics.get("lyapunov_layer_switch_cost", runtime_statistics.get("lyapunov_switch_cost", 0.01)))
+        summary["Lyapunov Layer Penalty Weight"] = float(runtime_statistics.get("lyapunov_layer_penalty_weight", 0.02))
+        summary["Lyapunov Prediction Beta"] = float(runtime_statistics.get("lyapunov_prediction_beta", 0.5))
+        summary["Lyapunov Ratio Acceptance Slope"] = float(runtime_statistics.get("lyapunov_ratio_acceptance_slope", 0.2))
+        summary["Lyapunov Layer Acceptance Slope"] = float(runtime_statistics.get("lyapunov_layer_acceptance_slope", 0.015))
+        summary["Lyapunov Cold Start Penalty"] = float(runtime_statistics.get("lyapunov_cold_start_penalty", 0.03))
+        summary["Lyapunov Virtual Queue Final"] = float(runtime_statistics.get("lyapunov_virtual_queue", 0.0))
+        summary["Lyapunov Virtual Queue Max"] = float(runtime_statistics.get("lyapunov_virtual_queue_max", 0.0))
+        lyapunov_decisions = int(runtime_statistics.get("lyapunov_decision_count", 0))
+        summary["Lyapunov Decision Count"] = lyapunov_decisions
+        summary["Lyapunov Virtual Queue Mean"] = (
+            float(runtime_statistics.get("lyapunov_virtual_queue_sum", 0.0)) / lyapunov_decisions
+            if lyapunov_decisions > 0
+            else 0.0
+        )
+        summary["Lyapunov Ratio Up Switches"] = int(runtime_statistics.get("lyapunov_ratio_up_switches", 0))
+        summary["Lyapunov Ratio Down Switches"] = int(runtime_statistics.get("lyapunov_ratio_down_switches", 0))
+        summary["Lyapunov Keep Decisions"] = int(runtime_statistics.get("lyapunov_keep_decisions", 0))
+        summary["Lyapunov Action Counts"] = runtime_statistics.get("lyapunov_action_counts", {})
         summary["Adaptive Question Count"] = int(runtime_statistics.get("adaptive_question_count", 0))
         summary["Adaptive Questions With Switch"] = int(runtime_statistics.get("adaptive_questions_with_switch", 0))
         summary["Adaptive Ratio Step Counts"] = runtime_statistics.get("adaptive_ratio_step_counts", {})
         summary["Adaptive Final Ratio Counts"] = runtime_statistics.get("adaptive_final_ratio_counts", {})
+        adaptive_step_config_stats = summarize_adaptive_step_config_stats(
+            runtime_statistics.get("adaptive_step_config_stats", {})
+        )
+        summary["Adaptive Step Trace Count"] = int(runtime_statistics.get("adaptive_step_trace_count", 0))
+        summary["Adaptive Step Config Count"] = len(adaptive_step_config_stats)
+        summary["Adaptive Step Config Stats"] = adaptive_step_config_stats
     elif (not runtime_statistics or not runtime_statistics.get("dynamic_retain_ratio")) and hasattr(model, "draft_kv_retain_ratio"):
         summary["Draft KV Retain Ratio"] = float(model.draft_kv_retain_ratio)
 
@@ -1209,6 +1410,8 @@ def get_model_answers(
         print("Draft KV Retain Ratio:", summary["Draft KV Retain Ratio"])
     if "Adaptive Total Switches" in summary:
         print("Adaptive Total Switches:", summary["Adaptive Total Switches"])
+    if "Adaptive Step Config Count" in summary:
+        print("Adaptive Step Config Count:", summary["Adaptive Step Config Count"])
     if "Accuracy" in summary:
         print("Accuracy:", summary["Accuracy"])
     if "Exact Match" in summary:
