@@ -6,6 +6,7 @@ python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fa
 import argparse
 import math
 import re
+import time
 from pyexpat import model
 import statistics
 
@@ -68,6 +69,8 @@ def retain_ratio_run_name(args):
         if getattr(args, "dynamic_retain_ratio", False):
             return "dynamic3"
         if getattr(args, "cosine_prefill_skip_layers", False):
+            if getattr(args, "adaptive_cold_start", False):
+                return "dynamic-6"
             if getattr(args, "lyapunov_adaptive_controller", False):
                 return "dynamic-5-lyapunov"
             if getattr(args, "adaptive_final2_controller", False):
@@ -144,6 +147,334 @@ def _record_adaptive_step_config(statistics, current_ratio, current_attn_skip_co
     entry["mean_accepted_step_mean"] = float(mean)
     entry["mean_accepted_step_m2"] = float(m2)
     statistics["adaptive_step_trace_count"] = int(statistics.get("adaptive_step_trace_count", 0)) + 1
+
+
+def _parse_optional_float_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [float(item) for item in value]
+    items = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if item:
+            items.append(float(item))
+    return items
+
+
+def _parse_optional_int_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [int(item) for item in value]
+    items = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if item:
+            items.append(int(item))
+    return items
+
+
+def _unique_sorted_values(values):
+    unique_values = []
+    for value in values:
+        if not any(abs(float(value) - float(existing)) < 1e-9 for existing in unique_values):
+            unique_values.append(value)
+    return sorted(unique_values)
+
+
+def _default_adaptive_cold_start_prompt(statistics):
+    # Dynamic-6 uses one task-agnostic repeat-passage warmup.  The goal is to
+    # exercise KV retention and layer skipping while final2 is already allowed
+    # to adapt, not to seed the table with benchmark-specific content.
+    return (
+        "Repeat the passage below exactly three times. Do not answer, explain, "
+        "summarize, translate, or add extra text.\n\n"
+        "Passage:\n"
+        "Careful systems improve when each step is measured, compared, and adjusted. "
+        "A small change can make the next step easier to verify, and a steady record "
+        "helps decide what to keep.\n\n"
+        "Repeated passage:"
+    )
+
+
+def _cold_start_ratio_values(statistics):
+    explicit_ratios = _parse_optional_float_list(statistics.get("adaptive_cold_start_ratios", ""))
+    if explicit_ratios:
+        return _unique_sorted_values([min(1.0, max(0.0, ratio)) for ratio in explicit_ratios if ratio > 0.0])
+
+    ladder = [float(value) for value in statistics.get("adaptive_ratio_ladder", [])]
+    if not ladder:
+        initial_ratio = float(statistics.get("adaptive_initial_retain_ratio", statistics.get("draft_kv_retain_ratio", 1.0)))
+        ladder = [initial_ratio]
+    ladder = _unique_sorted_values(ladder)
+    initial_ratio = float(statistics.get("adaptive_initial_retain_ratio", statistics.get("draft_kv_retain_ratio", ladder[0])))
+    nearest_index = min(range(len(ladder)), key=lambda index: abs(ladder[index] - initial_ratio))
+    start_index = max(0, nearest_index - 1)
+    end_index = min(len(ladder), nearest_index + 3)
+    selected = list(ladder[start_index:end_index])
+    if initial_ratio not in selected:
+        selected.append(initial_ratio)
+    return _unique_sorted_values(selected)
+
+
+def _cold_start_max_skip_count(model, statistics):
+    num_layers = int(getattr(getattr(model, "config", None), "num_hidden_layers", 0))
+    keep_first = max(0, int(statistics.get("cosine_keep_first_layers", 1)))
+    keep_last = max(0, int(statistics.get("cosine_keep_last_layers", 2)))
+    return max(0, num_layers - keep_first - keep_last)
+
+
+def _cold_start_skip_count_values(model, statistics):
+    max_skip_count = _cold_start_max_skip_count(model, statistics)
+    explicit_counts = _parse_optional_int_list(statistics.get("adaptive_cold_start_skip_counts", ""))
+    if explicit_counts:
+        values = [min(max_skip_count, max(0, count)) for count in explicit_counts]
+        return sorted(set(values))
+
+    current_count = _current_attn_skip_count(model, statistics)
+    delta = max(1, int(statistics.get("adaptive_cold_start_skip_delta", 2)))
+    values = [
+        max(0, current_count - delta),
+        current_count,
+        min(max_skip_count, current_count + delta),
+    ]
+    return sorted(set(values))
+
+
+def _build_cold_start_attn_skip_layers(model, statistics, target_skip_count):
+    num_layers = int(getattr(getattr(model, "config", None), "num_hidden_layers", 0))
+    keep_first = max(0, int(statistics.get("cosine_keep_first_layers", 1)))
+    keep_last = max(0, int(statistics.get("cosine_keep_last_layers", 2)))
+    last_layer_exclusive = max(keep_first, num_layers - keep_last)
+    eligible_layers = list(range(keep_first, last_layer_exclusive))
+    ranked_layers = list(statistics.get("cosine_attn_ranking") or [])
+    ranked_layers = [int(layer_id) for layer_id in ranked_layers if int(layer_id) in eligible_layers]
+    if not ranked_layers:
+        ranked_layers = [layer_id for layer_id in eligible_layers if layer_id % 2 == 1]
+        ranked_layers += [layer_id for layer_id in eligible_layers if layer_id % 2 == 0]
+    target_skip_count = min(max(0, int(target_skip_count)), len(eligible_layers))
+    return sorted(ranked_layers[:target_skip_count])
+
+
+def _merge_adaptive_config_entry(target_entry, source_entry, pseudo_count):
+    # Merge cold-start observations as a bounded pseudo-count.  This gives
+    # final2 a weak prior without letting the warmup dominate real task stats.
+    source_count = max(1, int(source_entry.get("step_count", 0)))
+    pseudo_count = max(1, int(pseudo_count))
+    source_mean = float(source_entry.get("mean_accepted_step_mean", 0.0))
+    source_m2 = float(source_entry.get("mean_accepted_step_m2", 0.0))
+    if source_count > 1 and pseudo_count > 1:
+        source_variance = max(0.0, source_m2 / (source_count - 1))
+        pseudo_m2 = source_variance * (pseudo_count - 1)
+    else:
+        pseudo_m2 = 0.0
+
+    accepted_per_step = float(source_entry.get("accepted_tokens", 0)) / source_count
+    drafted_per_step = float(source_entry.get("drafted_tokens", 0)) / source_count
+    pseudo_accepted = int(round(accepted_per_step * pseudo_count))
+    pseudo_drafted = int(round(drafted_per_step * pseudo_count))
+
+    target_count = int(target_entry.get("step_count", 0))
+    target_mean = float(target_entry.get("mean_accepted_step_mean", 0.0))
+    target_m2 = float(target_entry.get("mean_accepted_step_m2", 0.0))
+    if target_count <= 0:
+        target_entry["step_count"] = pseudo_count
+        target_entry["accepted_tokens"] = pseudo_accepted
+        target_entry["drafted_tokens"] = pseudo_drafted
+        target_entry["mean_accepted_step_mean"] = source_mean
+        target_entry["mean_accepted_step_m2"] = pseudo_m2
+        target_entry["cold_start_step_count"] = int(target_entry.get("cold_start_step_count", 0)) + pseudo_count
+        return
+
+    merged_count = target_count + pseudo_count
+    delta = source_mean - target_mean
+    merged_mean = target_mean + delta * pseudo_count / merged_count
+    merged_m2 = target_m2 + pseudo_m2 + delta * delta * target_count * pseudo_count / merged_count
+    target_entry["step_count"] = merged_count
+    target_entry["accepted_tokens"] = int(target_entry.get("accepted_tokens", 0)) + pseudo_accepted
+    target_entry["drafted_tokens"] = int(target_entry.get("drafted_tokens", 0)) + pseudo_drafted
+    target_entry["mean_accepted_step_mean"] = float(merged_mean)
+    target_entry["mean_accepted_step_m2"] = float(merged_m2)
+    target_entry["cold_start_step_count"] = int(target_entry.get("cold_start_step_count", 0)) + pseudo_count
+
+
+def _merge_adaptive_cold_start_stats(statistics, cold_statistics):
+    target_stats = statistics.setdefault("adaptive_step_config_stats", {})
+    source_stats = cold_statistics.get("adaptive_step_config_stats", {})
+    effective_count = max(1, int(statistics.get("adaptive_cold_start_effective_count", 16)))
+    merged_configs = 0
+    merged_steps = 0
+    for key, source_entry in source_stats.items():
+        source_count = int(source_entry.get("step_count", 0))
+        if source_count <= 0:
+            continue
+        pseudo_count = min(effective_count, source_count)
+        target_entry = target_stats.setdefault(key, {
+            "current_ratio": float(source_entry.get("current_ratio", 1.0)),
+            "current_attn_skip_count": int(source_entry.get("current_attn_skip_count", 0)),
+            "step_count": 0,
+            "accepted_tokens": 0,
+            "drafted_tokens": 0,
+            "mean_accepted_step_mean": 0.0,
+            "mean_accepted_step_m2": 0.0,
+        })
+        _merge_adaptive_config_entry(target_entry, source_entry, pseudo_count)
+        merged_configs += 1
+        merged_steps += pseudo_count
+    statistics["adaptive_cold_start_merged_config_count"] = int(statistics.get("adaptive_cold_start_merged_config_count", 0)) + merged_configs
+    statistics["adaptive_cold_start_effective_step_count"] = int(statistics.get("adaptive_cold_start_effective_step_count", 0)) + merged_steps
+
+
+def _build_cold_start_statistics(statistics, retain_ratio=None, mode="probe"):
+    # Cold start runs in an isolated statistics dict.  Only the config table is
+    # merged back, so warmup KV state and global acceptance references do not
+    # leak into the actual benchmark stream.
+    mode = str(mode).lower()
+    dynamic_mode = mode == "dynamic"
+    if retain_ratio is None:
+        retain_ratio = float(statistics.get("adaptive_initial_retain_ratio", statistics.get("draft_kv_retain_ratio", 1.0)))
+    retain_ratio = float(retain_ratio)
+    ratio_ladder = (
+        [float(value) for value in statistics.get("adaptive_ratio_ladder", [retain_ratio])]
+        if dynamic_mode
+        else [retain_ratio]
+    )
+    if not any(abs(retain_ratio - value) < 1e-9 for value in ratio_ladder):
+        ratio_ladder.append(retain_ratio)
+    cold_statistics = dict(statistics)
+    cold_statistics.update({
+        "optimization": False,
+        "bayes": False,
+        "local_adaptive_controller": True,
+        "dynamic_retain_ratio": False,
+        "adaptive_aggressive_controller": False,
+        "adaptive_final_controller": False,
+        "adaptive_final2_controller": bool(dynamic_mode and statistics.get("adaptive_final2_controller", False)),
+        "lyapunov_adaptive_controller": False,
+        "adaptive_layer_controller": bool(dynamic_mode and statistics.get("adaptive_layer_controller", False)),
+        "cosine_prefill_skip_layers": bool(dynamic_mode and statistics.get("cosine_prefill_skip_layers", False)),
+        "draft_kv_retain_ratio": retain_ratio,
+        "adaptive_initial_retain_ratio": retain_ratio,
+        "adaptive_ratio_ladder": sorted(set(ratio_ladder)),
+        "adaptive_window": int(statistics.get("adaptive_window", 16)) if dynamic_mode else 10 ** 9,
+        "adaptive_min_observations": int(statistics.get("adaptive_min_observations", 24)) if dynamic_mode else 10 ** 9,
+        "adaptive_step_config_stats": {},
+        "adaptive_step_trace_count": 0,
+        "mean_accepted_tokens": [],
+        "accepted_tokens": [],
+        "drafted_tokens": [],
+        "adaptive_switch_events": [],
+        "final2_decisions": [],
+    })
+    return cold_statistics
+
+
+def run_adaptive_cold_start(model, tokenizer, statistics, logits_processor=None):
+    if not statistics.get("adaptive_cold_start", False):
+        return
+    if not statistics.get("local_adaptive_controller", False):
+        return
+
+    start_time = time.perf_counter()
+    mode = str(statistics.get("adaptive_cold_start_mode", "dynamic")).lower()
+    prompt = str(statistics.get("adaptive_cold_start_prompt", "")).strip()
+    if not prompt or prompt.lower() == "auto":
+        prompt = _default_adaptive_cold_start_prompt(statistics)
+
+    ratios = _cold_start_ratio_values(statistics)
+    skip_counts = _cold_start_skip_count_values(model, statistics)
+    max_configs = max(1, int(statistics.get("adaptive_cold_start_max_configs", 12)))
+    max_new_tokens = max(1, int(statistics.get("adaptive_cold_start_max_new_tokens", 128)))
+    max_steps = max(1, int(statistics.get("adaptive_cold_start_max_steps", max_new_tokens)))
+    original_attn_skip_layers, original_mlp_skip_layers = model.get_skip_layers()
+    original_attn_skip_layers = [int(layer_id) for layer_id in list(original_attn_skip_layers)]
+    original_mlp_skip_layers = [int(layer_id) for layer_id in list(original_mlp_skip_layers)]
+    original_retain_ratio = getattr(model, "draft_kv_retain_ratio", statistics.get("draft_kv_retain_ratio", 1.0))
+
+    configs = []
+    if mode == "probe":
+        # Probe mode is kept as an ablation: it evaluates fixed ratio/layer
+        # pairs and then merges their table entries as low-weight priors.
+        for ratio in ratios:
+            for skip_count in skip_counts:
+                configs.append((float(ratio), int(skip_count)))
+                if len(configs) >= max_configs:
+                    break
+            if len(configs) >= max_configs:
+                break
+    else:
+        # Dynamic mode is the default dynamic-6 path.  It lets final2 adapt
+        # during one repeat-passage prompt instead of sweeping synthetic configs.
+        configs.append((
+            float(statistics.get("adaptive_initial_retain_ratio", statistics.get("draft_kv_retain_ratio", 1.0))),
+            _current_attn_skip_count(model, statistics),
+        ))
+
+    statistics["adaptive_cold_start_version"] = "dynamic-6"
+    statistics["adaptive_cold_start_mode"] = mode
+    statistics["adaptive_cold_start_requested_config_count"] = len(configs)
+    statistics["adaptive_cold_start_prompt"] = prompt
+    raw_steps = 0
+    raw_new_tokens = 0
+    raw_draft_tokens = 0
+    raw_accept_lengths = []
+
+    try:
+        device = next(model.parameters()).device
+        if getattr(tokenizer, "chat_template", None):
+            warmup_input_ids = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True,
+                return_tensors="pt",
+            ).to(device)
+        else:
+            encoded = tokenizer(prompt, return_tensors="pt")
+            warmup_input_ids = encoded["input_ids"].to(device)
+        for retain_ratio, skip_count in configs:
+            if mode == "probe":
+                attn_skip_layers = _build_cold_start_attn_skip_layers(model, statistics, skip_count)
+                model.set_skip_layers(attn_skip_layers, original_mlp_skip_layers)
+            else:
+                model.set_skip_layers(original_attn_skip_layers, original_mlp_skip_layers)
+            cold_statistics = _build_cold_start_statistics(statistics, retain_ratio, mode=mode)
+            _output_ids, new_token_num, step_count, accept_lengths, draft_token_num = swift_forward(
+                warmup_input_ids,
+                model,
+                tokenizer,
+                max_new_tokens=max_new_tokens,
+                statistics=cold_statistics,
+                optimizer=None,
+                utility=None,
+                logits_processor=logits_processor,
+                max_steps=max_steps,
+            )
+            _merge_adaptive_cold_start_stats(statistics, cold_statistics)
+            raw_steps += int(step_count)
+            raw_new_tokens += int(new_token_num)
+            raw_draft_tokens += int(draft_token_num)
+            raw_accept_lengths.extend([int(value) for value in accept_lengths])
+            if mode != "probe":
+                statistics["adaptive_cold_start_dynamic_switches"] = int(cold_statistics.get("adaptive_total_switches", 0))
+                statistics["adaptive_cold_start_dynamic_layer_switches"] = int(cold_statistics.get("adaptive_layer_total_switches", 0))
+                statistics["adaptive_cold_start_final_ratio_counts"] = dict(cold_statistics.get("adaptive_final_ratio_counts", {}))
+                statistics["adaptive_cold_start_ratio_step_counts"] = dict(cold_statistics.get("adaptive_ratio_step_counts", {}))
+                statistics["adaptive_cold_start_final2_action_counts"] = dict(cold_statistics.get("adaptive_final2_controller_action_counts", {}))
+    finally:
+        model.set_skip_layers(original_attn_skip_layers, original_mlp_skip_layers)
+        model.draft_kv_retain_ratio = original_retain_ratio
+        reset_draft_attention_reuse(model)
+
+    elapsed = time.perf_counter() - start_time
+    statistics["adaptive_cold_start_time_sec"] = float(elapsed)
+    statistics["adaptive_cold_start_raw_step_count"] = raw_steps
+    statistics["adaptive_cold_start_raw_new_tokens"] = raw_new_tokens
+    statistics["adaptive_cold_start_raw_draft_tokens"] = raw_draft_tokens
+    if raw_accept_lengths:
+        statistics["adaptive_cold_start_mean_accepted_tokens"] = float(sum(raw_accept_lengths) / len(raw_accept_lengths))
+    if raw_draft_tokens > 0:
+        accepted_draft_tokens = max(0, sum(raw_accept_lengths) - len(raw_accept_lengths))
+        statistics["adaptive_cold_start_token_acceptance_rate"] = float(accepted_draft_tokens / raw_draft_tokens)
 
 
 def _clamp01(value):
@@ -1040,33 +1371,7 @@ def _final2_predict_config(statistics, metrics, current_ratio, target_ratio,
 def _final2_can_increase_layer(statistics, model, state, current_skip_count, metrics):
     if not _adaptive_layer_controller_enabled(statistics):
         return False
-    hard_max = int(statistics.get("final2_hard_max_skip_layers", 19))
-    soft_max = int(statistics.get("final2_soft_max_skip_layers", min(18, hard_max)))
-    target_skip_count = int(current_skip_count) + 1
-    if target_skip_count > hard_max:
-        return False
-    current_ratio = float(state["current_ratio"])
-    min_ratio = float(statistics.get("final2_min_ratio_for_more_skip", 0.4))
-    if current_ratio < min_ratio:
-        return False
-    low_guard_ratio = float(statistics.get("final2_low_ratio_guard", 0.2))
-    low_guard_skip = int(statistics.get("final2_low_ratio_guard_skip_layers", 17))
-    if current_ratio <= low_guard_ratio and target_skip_count >= low_guard_skip:
-        return False
-    if not _lyapunov_layer_can_increase(statistics, model, state):
-        return False
-    if target_skip_count <= soft_max:
-        return True
-
-    hard_probe_margin = max(0.0, float(statistics.get("final2_hard_probe_mean_margin", 0.3)))
-    hard_probe_token_floor = float(statistics.get("final2_hard_probe_token_acceptance_floor", 0.92))
-    hard_probe_draft_margin = max(0.0, float(statistics.get("final2_hard_probe_draft_len_margin", 0.3)))
-    more_draft_floor = float(statistics.get("final2_more_aggressive_draft_len_floor", 2.2))
-    return (
-        metrics["window_mean_accept"] >= metrics["upper_mean_bound"] + hard_probe_margin
-        and metrics["window_token_acceptance"] >= hard_probe_token_floor
-        and metrics["window_draft_len"] >= more_draft_floor + hard_probe_draft_margin
-    )
+    return _lyapunov_layer_can_increase(statistics, model, state)
 
 
 def _final2_make_candidate(statistics, metrics, current_ratio, current_skip_count,
@@ -1199,9 +1504,6 @@ def _update_final2_adaptive_controller(statistics, model, state, step_idx):
     more_token_floor = float(statistics.get("final2_more_aggressive_token_acceptance_floor", 0.90))
     draft_floor = float(statistics.get("final2_draft_len_floor", 2.0))
     more_draft_floor = float(statistics.get("final2_more_aggressive_draft_len_floor", 2.2))
-    hard_max = int(statistics.get("final2_hard_max_skip_layers", 19))
-    low_guard_ratio = float(statistics.get("final2_low_ratio_guard", 0.2))
-    low_guard_skip = int(statistics.get("final2_low_ratio_guard_skip_layers", 17))
     switch_cost = float(statistics.get("final2_switch_cost", 0.02))
     layer_switch_cost = float(statistics.get("final2_layer_switch_cost", switch_cost))
 
@@ -1209,13 +1511,11 @@ def _update_final2_adaptive_controller(statistics, model, state, step_idx):
         metrics["window_mean_accept"] < metrics["lower_mean_bound"]
         or metrics["window_token_acceptance"] < token_floor
         or metrics["window_draft_len"] < draft_floor
-        or current_skip_count > hard_max
     )
     aggressive = (
         metrics["window_mean_accept"] > metrics["upper_mean_bound"]
         and metrics["window_token_acceptance"] >= more_token_floor
         and metrics["window_draft_len"] >= more_draft_floor
-        and current_skip_count <= hard_max
     )
 
     if recovery:
@@ -1227,25 +1527,18 @@ def _update_final2_adaptive_controller(statistics, model, state, step_idx):
             return False
 
         candidates = []
-        if current_skip_count > hard_max and _lyapunov_layer_can_reduce(statistics, model):
+        if current_level < len(ladder) - 1:
             candidates.append(_final2_make_candidate(
                 statistics, metrics, current_ratio, current_skip_count,
-                "less_skip", "final2_less_skip_recovery_hard_cap", current_level,
+                "ratio_up", "final2_ratio_up_recovery", current_level + 1,
+                float(ladder[current_level + 1]), current_skip_count, switch_cost,
+            ))
+        if _lyapunov_layer_can_reduce(statistics, model):
+            candidates.append(_final2_make_candidate(
+                statistics, metrics, current_ratio, current_skip_count,
+                "less_skip", "final2_less_skip_recovery", current_level,
                 current_ratio, max(0, current_skip_count - 1), layer_switch_cost,
             ))
-        else:
-            if current_level < len(ladder) - 1:
-                candidates.append(_final2_make_candidate(
-                    statistics, metrics, current_ratio, current_skip_count,
-                    "ratio_up", "final2_ratio_up_recovery", current_level + 1,
-                    float(ladder[current_level + 1]), current_skip_count, switch_cost,
-                ))
-            if _lyapunov_layer_can_reduce(statistics, model):
-                candidates.append(_final2_make_candidate(
-                    statistics, metrics, current_ratio, current_skip_count,
-                    "less_skip", "final2_less_skip_recovery", current_level,
-                    current_ratio, max(0, current_skip_count - 1), layer_switch_cost,
-                ))
 
         if not candidates:
             _final2_record_keep(statistics)
@@ -1272,13 +1565,11 @@ def _update_final2_adaptive_controller(statistics, model, state, step_idx):
     candidates = []
     if current_level > 0:
         target_ratio = float(ladder[current_level - 1])
-        blocks_low_ratio_high_skip = current_skip_count >= low_guard_skip and target_ratio <= low_guard_ratio
-        if not blocks_low_ratio_high_skip:
-            candidates.append(_final2_make_candidate(
-                statistics, metrics, current_ratio, current_skip_count,
-                "ratio_down", "final2_ratio_down_high_mean", current_level - 1,
-                target_ratio, current_skip_count, switch_cost,
-            ))
+        candidates.append(_final2_make_candidate(
+            statistics, metrics, current_ratio, current_skip_count,
+            "ratio_down", "final2_ratio_down_high_mean", current_level - 1,
+            target_ratio, current_skip_count, switch_cost,
+        ))
     if _final2_can_increase_layer(statistics, model, state, current_skip_count, metrics):
         candidates.append(_final2_make_candidate(
             statistics, metrics, current_ratio, current_skip_count,
@@ -1750,6 +2041,8 @@ def build_skip_layer_cache_key(args):
         f"skip-ratio-{args.skip_ratio}",
         f"draft-token-num-{draft_token_num}",
         f"opt-compressed-draft-kv-{args.optimize_with_compressed_draft_kv}",
+        f"draft-kv-cache-mode-{args.draft_kv_cache_mode}",
+        f"draft-kv-score-source-{args.draft_kv_score_source}",
     ]
     if args.dynamic_retain_ratio:
         parts.extend([
@@ -1844,6 +2137,9 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
     
     model.draft_kv_compress = statistics.get("draft_kv_compress", False)
     model.draft_kv_retain_ratio = statistics.get("draft_kv_retain_ratio", 1.0)
+    model.draft_kv_cache_mode = statistics.get("draft_kv_cache_mode", "copy")
+    model.draft_kv_score_source = statistics.get("draft_kv_score_source", "heuristic")
+    reset_draft_attention_reuse(model)
     statistics["adaptive_last_sample"] = None
     local_adaptive_state = None
     if _local_adaptive_ready(statistics):
@@ -1946,6 +2242,13 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
         cur_length = accept_length_tree + cur_length
         accept_length_list.append(accept_length_tree)
         total_acc_num += accept_length_tree - 1
+        if statistics.get("draft_kv_score_source") == "reuse":
+            apply_draft_attention_reuse_reward(
+                model,
+                accepted_draft_tokens=accept_length_tree - 1,
+                drafted_tokens=step_draft_token_num,
+                statistics=statistics,
+            )
 
         should_stop = (
             _contains_eos_token(input_ids[0, input_len:].tolist(), eos_token_ids)
@@ -1990,6 +2293,7 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             max_new_tokens=max_new_tokens,
             logits_processor=logits_processor,
             draft_token_num=fixed_draft_token_num,
+            statistics=statistics,
         )
     logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
     _finish_local_adaptive_sample(statistics, local_adaptive_state, total_acc_num, draft_token_num)
@@ -2227,6 +2531,26 @@ if __name__ == "__main__":
         type=float,
         default=1.0,
         help="Retain ratio of KV cache during draft. 1.0 means no compression.",
+    )
+    parser.add_argument(
+        "--draft-kv-cache-mode",
+        type=str,
+        default="copy",
+        choices=["copy", "mask"],
+        help="Draft KV compression implementation: physically copy selected KV, or keep full KV and mask unselected tokens.",
+    )
+    parser.add_argument(
+        "--draft-kv-score-source",
+        type=str,
+        default="heuristic",
+        choices=["heuristic", "observation", "reuse"],
+        help="Token-importance source for draft KV compression: heuristic, observation forward, or reused previous draft attention.",
+    )
+    parser.add_argument(
+        "--draft-kv-reuse-ema",
+        type=float,
+        default=0.7,
+        help="EMA weight for previous reused draft attention scores. Used only when --draft-kv-score-source reuse.",
     )
     parser.add_argument(
         "--dynamic-retain-ratio",
@@ -2615,54 +2939,6 @@ if __name__ == "__main__":
         help="Drafted tokens per step required before dynamic-4-final2 can move to a more compressed config.",
     )
     parser.add_argument(
-        "--final2-soft-max-skip-layers",
-        type=int,
-        default=18,
-        help="Soft skipped-attention-layer cap for dynamic-4-final2; probing above it needs stronger margins.",
-    )
-    parser.add_argument(
-        "--final2-hard-max-skip-layers",
-        type=int,
-        default=19,
-        help="Hard skipped-attention-layer cap for dynamic-4-final2.",
-    )
-    parser.add_argument(
-        "--final2-min-ratio-for-more-skip",
-        type=float,
-        default=0.4,
-        help="Minimum retain ratio allowed when dynamic-4-final2 adds a skipped layer.",
-    )
-    parser.add_argument(
-        "--final2-low-ratio-guard",
-        type=float,
-        default=0.2,
-        help="Retain-ratio value considered too low to pair with high skipped-layer counts in dynamic-4-final2.",
-    )
-    parser.add_argument(
-        "--final2-low-ratio-guard-skip-layers",
-        type=int,
-        default=17,
-        help="Skipped-layer count where dynamic-4-final2 blocks very low retain ratios.",
-    )
-    parser.add_argument(
-        "--final2-hard-probe-mean-margin",
-        type=float,
-        default=0.3,
-        help="Extra mean-accepted margin required to probe above the final2 soft skip cap.",
-    )
-    parser.add_argument(
-        "--final2-hard-probe-token-acceptance-floor",
-        type=float,
-        default=0.92,
-        help="Token acceptance required to probe above the final2 soft skip cap.",
-    )
-    parser.add_argument(
-        "--final2-hard-probe-draft-len-margin",
-        type=float,
-        default=0.3,
-        help="Extra draft-length margin required to probe above the final2 soft skip cap.",
-    )
-    parser.add_argument(
         "--final2-switch-cost",
         type=float,
         default=0.02,
@@ -2685,6 +2961,67 @@ if __name__ == "__main__":
         type=float,
         default=2.0,
         help="Compression-gain weight for dynamic-4-final2 more-skip candidates.",
+    )
+    parser.add_argument(
+        "--adaptive-cold-start",
+        action="store_true",
+        default=False,
+        help="Run one prompt before evaluation to seed the adaptive ratio/layer config table. Named dynamic-6.",
+    )
+    parser.add_argument(
+        "--adaptive-cold-start-mode",
+        type=str,
+        default="dynamic",
+        choices=["dynamic", "probe"],
+        help="Cold-start strategy: dynamic runs one repeat-passage warmup with final2 enabled; probe tests fixed config pairs.",
+    )
+    parser.add_argument(
+        "--adaptive-cold-start-prompt",
+        type=str,
+        default="auto",
+        help="Prompt used once at startup to seed the adaptive config table.",
+    )
+    parser.add_argument(
+        "--adaptive-cold-start-max-new-tokens",
+        type=int,
+        default=128,
+        help="Maximum new tokens generated by each cold-start config.",
+    )
+    parser.add_argument(
+        "--adaptive-cold-start-max-steps",
+        type=int,
+        default=128,
+        help="Maximum SWIFT decode steps per cold-start config.",
+    )
+    parser.add_argument(
+        "--adaptive-cold-start-effective-count",
+        type=int,
+        default=16,
+        help="Maximum pseudo-observations merged into the adaptive table per cold-start config.",
+    )
+    parser.add_argument(
+        "--adaptive-cold-start-max-configs",
+        type=int,
+        default=12,
+        help="Maximum ratio/layer configs probed during cold start.",
+    )
+    parser.add_argument(
+        "--adaptive-cold-start-ratios",
+        type=str,
+        default="",
+        help="Optional comma-separated retain ratios for cold start. Empty uses ratios near the initial ratio.",
+    )
+    parser.add_argument(
+        "--adaptive-cold-start-skip-counts",
+        type=str,
+        default="",
+        help="Optional comma-separated skipped-attention-layer counts for cold start. Empty probes around the current count.",
+    )
+    parser.add_argument(
+        "--adaptive-cold-start-skip-delta",
+        type=int,
+        default=2,
+        help="Layer-count delta used when cold-start skip counts are not explicitly provided.",
     )
 
     parser.add_argument(
@@ -2880,6 +3217,8 @@ if __name__ == "__main__":
         parser.error("--draft-token-num must be a positive integer.")
     if args.draft_kv_retain_ratio <= 0.0 or args.draft_kv_retain_ratio > 1.0:
         parser.error("--draft-kv-retain-ratio must be in the range (0, 1].")
+    if args.draft_kv_reuse_ema < 0.0 or args.draft_kv_reuse_ema > 1.0:
+        parser.error("--draft-kv-reuse-ema must be in the range [0, 1].")
     if args.retain_warmup_rounds <= 0:
         parser.error("--retain-warmup-rounds must be a positive integer.")
     if args.retain_filter_top_k <= 0:
@@ -2995,8 +3334,6 @@ if __name__ == "__main__":
         ("--final2-cold-start-penalty", args.final2_cold_start_penalty),
         ("--final2-draft-len-floor", args.final2_draft_len_floor),
         ("--final2-more-aggressive-draft-len-floor", args.final2_more_aggressive_draft_len_floor),
-        ("--final2-hard-probe-mean-margin", args.final2_hard_probe_mean_margin),
-        ("--final2-hard-probe-draft-len-margin", args.final2_hard_probe_draft_len_margin),
         ("--final2-switch-cost", args.final2_switch_cost),
         ("--final2-layer-switch-cost", args.final2_layer_switch_cost),
         ("--final2-ratio-down-gain-weight", args.final2_ratio_down_gain_weight),
@@ -3007,9 +3344,6 @@ if __name__ == "__main__":
     for name, value in [
         ("--final2-token-acceptance-floor", args.final2_token_acceptance_floor),
         ("--final2-more-aggressive-token-acceptance-floor", args.final2_more_aggressive_token_acceptance_floor),
-        ("--final2-hard-probe-token-acceptance-floor", args.final2_hard_probe_token_acceptance_floor),
-        ("--final2-min-ratio-for-more-skip", args.final2_min_ratio_for_more_skip),
-        ("--final2-low-ratio-guard", args.final2_low_ratio_guard),
     ]:
         if value < 0.0 or value > 1.0:
             parser.error(f"{name} must be in the range [0, 1].")
@@ -3017,12 +3351,21 @@ if __name__ == "__main__":
         parser.error("--final2-more-aggressive-token-acceptance-floor must be >= --final2-token-acceptance-floor.")
     if args.final2_more_aggressive_draft_len_floor < args.final2_draft_len_floor:
         parser.error("--final2-more-aggressive-draft-len-floor must be >= --final2-draft-len-floor.")
-    if args.final2_soft_max_skip_layers < 0 or args.final2_hard_max_skip_layers < 0:
-        parser.error("--final2-soft-max-skip-layers and --final2-hard-max-skip-layers must be non-negative.")
-    if args.final2_soft_max_skip_layers > args.final2_hard_max_skip_layers:
-        parser.error("--final2-soft-max-skip-layers must be <= --final2-hard-max-skip-layers.")
-    if args.final2_low_ratio_guard_skip_layers < 0:
-        parser.error("--final2-low-ratio-guard-skip-layers must be non-negative.")
+    for name, value in [
+        ("--adaptive-cold-start-max-new-tokens", args.adaptive_cold_start_max_new_tokens),
+        ("--adaptive-cold-start-max-steps", args.adaptive_cold_start_max_steps),
+        ("--adaptive-cold-start-effective-count", args.adaptive_cold_start_effective_count),
+        ("--adaptive-cold-start-max-configs", args.adaptive_cold_start_max_configs),
+    ]:
+        if value <= 0:
+            parser.error(f"{name} must be a positive integer.")
+    if args.adaptive_cold_start_skip_delta < 0:
+        parser.error("--adaptive-cold-start-skip-delta must be non-negative.")
+    try:
+        _parse_optional_float_list(args.adaptive_cold_start_ratios)
+        _parse_optional_int_list(args.adaptive_cold_start_skip_counts)
+    except ValueError as exc:
+        parser.error(f"Invalid adaptive cold-start list: {exc}")
     if args.lyapunov_acceptance_target > 1.0:
         parser.error("--lyapunov-acceptance-target must be <= 1.0; use <=0 to track the running reference acceptance.")
     if args.lyapunov_v < 0.0:
@@ -3093,6 +3436,12 @@ if __name__ == "__main__":
         parser.error("--adaptive-final2-controller requires --local-adaptive-controller.")
     if args.adaptive_final2_controller and not args.cosine_prefill_skip_layers:
         parser.error("--adaptive-final2-controller requires --cosine-prefill-skip-layers.")
+    if args.adaptive_cold_start and not args.local_adaptive_controller:
+        parser.error("--adaptive-cold-start requires --local-adaptive-controller.")
+    if args.adaptive_cold_start and not args.adaptive_final2_controller:
+        parser.error("--adaptive-cold-start is intended for the final2 adaptive table and requires --adaptive-final2-controller.")
+    if args.adaptive_cold_start and not args.cosine_prefill_skip_layers:
+        parser.error("--adaptive-cold-start requires --cosine-prefill-skip-layers.")
     if args.lyapunov_adaptive_controller and not args.local_adaptive_controller:
         parser.error("--lyapunov-adaptive-controller requires --local-adaptive-controller.")
     enabled_policy_count = sum([
@@ -3160,12 +3509,16 @@ if __name__ == "__main__":
 
     retain_ratio_name = retain_ratio_run_name(args)
     cosine_name_suffix = ""
+    kv_cache_name_suffix = "-kvmask" if args.draft_kv_compress and args.draft_kv_cache_mode == "mask" else ""
+    kv_score_name_suffix = "-kvsrc-" + args.draft_kv_score_source if args.draft_kv_compress else ""
     args.model_name = (args.model_id + "-swift-" + str(args.dtype)+ "-temp-" + str(args.temperature)
                        + "-top-p-" + str(args.top_p) + "-seed-" + str(args.seed) + "-max_new_tokens-" + str(args.max_new_tokens)+ "-opt_interval-" + str(args.opt_interval)
                     #    + "-bayes_interval-" + str(args.bayes_interval) + "-max_opt-" + str(args.max_opt_iter) + "-max_tolerance-" + str(args.max_tolerance_iter)
                        + "-max_score-" + str(args.max_score) + "-context_window-" + str(args.context_window) + "-skip_ratio-" + str(args.skip_ratio) + "-draft_kv_retain_ratio-" + retain_ratio_name
                        + "-opt_compressed_draft_kv-" + str(args.optimize_with_compressed_draft_kv)
                        + cosine_name_suffix
+                       + kv_cache_name_suffix
+                       + kv_score_name_suffix
                        + ("-draft_token_num-" + str(args.draft_token_num) if args.draft_token_num is not None else "")
                        + ("-draft_only" if args.draft_only else ""))
     answer_file = args.answer_file or f"outputs/{args.task_name}/{args.task_name}_{args.data_num}/without_layerskip_draft_model_answer/{args.model_id}/{args.model_name}.jsonl"
@@ -3229,11 +3582,15 @@ if __name__ == "__main__":
     utility = UtilityFunction(kind="ucb", kappa=2.5, xi=0.0)
 
     statistics = {"origin_score": 0, "opt_iter": 0, "tolerance_iter": 0,
+                  "task_name": args.task_name,
                   "skip_ratio": args.skip_ratio, "acceptance_rate_list": [], "opt_interval": args.opt_interval,
                   "bayes_interval": args.bayes_interval, "max_opt_iter": args.max_opt_iter,
                   "max_tolerance_iter": args.max_tolerance_iter, "max_score": args.max_score,
                   "context_window": args.context_window, "optimization": args.optimization, "bayes": args.bayes,
                   "draft_kv_compress": args.draft_kv_compress, "draft_kv_retain_ratio": args.draft_kv_retain_ratio,
+                  "draft_kv_cache_mode": args.draft_kv_cache_mode,
+                  "draft_kv_score_source": args.draft_kv_score_source,
+                  "draft_kv_reuse_ema": args.draft_kv_reuse_ema,
                   "optimize_with_compressed_draft_kv": args.optimize_with_compressed_draft_kv,
                   "draft_token_num": args.draft_token_num,
                   "log_draft_tokens": args.log_draft_tokens,
@@ -3288,18 +3645,20 @@ if __name__ == "__main__":
                   "final2_more_aggressive_token_acceptance_floor": args.final2_more_aggressive_token_acceptance_floor,
                   "final2_draft_len_floor": args.final2_draft_len_floor,
                   "final2_more_aggressive_draft_len_floor": args.final2_more_aggressive_draft_len_floor,
-                  "final2_soft_max_skip_layers": args.final2_soft_max_skip_layers,
-                  "final2_hard_max_skip_layers": args.final2_hard_max_skip_layers,
-                  "final2_min_ratio_for_more_skip": args.final2_min_ratio_for_more_skip,
-                  "final2_low_ratio_guard": args.final2_low_ratio_guard,
-                  "final2_low_ratio_guard_skip_layers": args.final2_low_ratio_guard_skip_layers,
-                  "final2_hard_probe_mean_margin": args.final2_hard_probe_mean_margin,
-                  "final2_hard_probe_token_acceptance_floor": args.final2_hard_probe_token_acceptance_floor,
-                  "final2_hard_probe_draft_len_margin": args.final2_hard_probe_draft_len_margin,
                   "final2_switch_cost": args.final2_switch_cost,
                   "final2_layer_switch_cost": args.final2_layer_switch_cost,
                   "final2_ratio_down_gain_weight": args.final2_ratio_down_gain_weight,
                   "final2_layer_skip_gain_weight": args.final2_layer_skip_gain_weight,
+                  "adaptive_cold_start": args.adaptive_cold_start,
+                  "adaptive_cold_start_mode": args.adaptive_cold_start_mode,
+                  "adaptive_cold_start_prompt": args.adaptive_cold_start_prompt,
+                  "adaptive_cold_start_max_new_tokens": args.adaptive_cold_start_max_new_tokens,
+                  "adaptive_cold_start_max_steps": args.adaptive_cold_start_max_steps,
+                  "adaptive_cold_start_effective_count": args.adaptive_cold_start_effective_count,
+                  "adaptive_cold_start_max_configs": args.adaptive_cold_start_max_configs,
+                  "adaptive_cold_start_ratios": args.adaptive_cold_start_ratios,
+                  "adaptive_cold_start_skip_counts": args.adaptive_cold_start_skip_counts,
+                  "adaptive_cold_start_skip_delta": args.adaptive_cold_start_skip_delta,
                   "lyapunov_adaptive_controller": args.lyapunov_adaptive_controller,
                   "lyapunov_acceptance_target": args.lyapunov_acceptance_target,
                   "lyapunov_v": args.lyapunov_v,
@@ -3335,6 +3694,9 @@ if __name__ == "__main__":
                   "adaptive_std_floor": args.adaptive_std_floor,
                   "adaptive_patience": args.adaptive_patience,
                   "adaptive_cooldown": args.adaptive_cooldown}
+
+    # Run dynamic-6 warmup once before the benchmark stream, never per question.
+    run_adaptive_cold_start(model, tokenizer, statistics, logits_processor=logits_processor)
 
     forward_f = draft_only_forward if args.draft_only else swift_forward
     run_eval(

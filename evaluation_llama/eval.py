@@ -1203,6 +1203,16 @@ def get_model_answers(
         summary["Best MLP Layer Set"] = [int(x) for x in list(best_mlp_skip_layer_id_set)]
 
     runtime_statistics = forward_kwargs.get("statistics")
+    if runtime_statistics and runtime_statistics.get("draft_kv_score_source"):
+        summary["Draft KV Cache Mode"] = runtime_statistics.get("draft_kv_cache_mode", "copy")
+        summary["Draft KV Score Source"] = runtime_statistics.get("draft_kv_score_source")
+        summary["Draft KV Copy Cache Rebuilds"] = int(runtime_statistics.get("draft_kv_copy_cache_rebuilds", 0))
+        summary["Draft KV Mask Cache Rebuilds"] = int(runtime_statistics.get("draft_kv_mask_cache_rebuilds", 0))
+        summary["Draft KV Reuse EMA"] = float(runtime_statistics.get("draft_kv_reuse_ema", 0.7))
+        summary["Draft KV Reuse Score Hits"] = int(runtime_statistics.get("draft_kv_reuse_score_hits", 0))
+        summary["Draft KV Reuse Score Misses"] = int(runtime_statistics.get("draft_kv_reuse_score_misses", 0))
+        summary["Draft KV Reuse Score Updates"] = int(runtime_statistics.get("draft_kv_reuse_score_updates", 0))
+        summary["Draft KV Reuse Empty Updates"] = int(runtime_statistics.get("draft_kv_reuse_score_empty_updates", 0))
     if runtime_statistics and runtime_statistics.get("cosine_prefill_skip_layers"):
         summary["Cosine Prefill Skip Layers"] = True
         summary["Cosine Skip Mode"] = runtime_statistics.get("cosine_skip_mode", "topk")
@@ -1323,14 +1333,6 @@ def get_model_answers(
         summary["Final2 More Aggressive Token Acceptance Floor"] = float(runtime_statistics.get("final2_more_aggressive_token_acceptance_floor", 0.90))
         summary["Final2 Draft Len Floor"] = float(runtime_statistics.get("final2_draft_len_floor", 2.0))
         summary["Final2 More Aggressive Draft Len Floor"] = float(runtime_statistics.get("final2_more_aggressive_draft_len_floor", 2.2))
-        summary["Final2 Soft Max Skip Layers"] = int(runtime_statistics.get("final2_soft_max_skip_layers", 18))
-        summary["Final2 Hard Max Skip Layers"] = int(runtime_statistics.get("final2_hard_max_skip_layers", 19))
-        summary["Final2 Min Ratio For More-Skip"] = float(runtime_statistics.get("final2_min_ratio_for_more_skip", 0.4))
-        summary["Final2 Low Ratio Guard"] = float(runtime_statistics.get("final2_low_ratio_guard", 0.2))
-        summary["Final2 Low Ratio Guard Skip Layers"] = int(runtime_statistics.get("final2_low_ratio_guard_skip_layers", 17))
-        summary["Final2 Hard Probe Mean Margin"] = float(runtime_statistics.get("final2_hard_probe_mean_margin", 0.3))
-        summary["Final2 Hard Probe Token Acceptance Floor"] = float(runtime_statistics.get("final2_hard_probe_token_acceptance_floor", 0.92))
-        summary["Final2 Hard Probe Draft Len Margin"] = float(runtime_statistics.get("final2_hard_probe_draft_len_margin", 0.3))
         summary["Final2 Switch Cost"] = float(runtime_statistics.get("final2_switch_cost", 0.02))
         summary["Final2 Layer Switch Cost"] = float(runtime_statistics.get("final2_layer_switch_cost", runtime_statistics.get("final2_switch_cost", 0.02)))
         summary["Final2 Ratio Down Gain Weight"] = float(runtime_statistics.get("final2_ratio_down_gain_weight", 1.0))
@@ -1339,6 +1341,31 @@ def get_model_answers(
         summary["Final2 Keep Decisions"] = int(runtime_statistics.get("final2_keep_decisions", 0))
         summary["Final2 Controller Action Counts"] = runtime_statistics.get("adaptive_final2_controller_action_counts", {})
         summary["Final2 Prediction Source Counts"] = runtime_statistics.get("final2_prediction_source_counts", {})
+        if runtime_statistics.get("adaptive_cold_start", False):
+            summary["Adaptive Cold Start"] = True
+            summary["Adaptive Cold Start Version"] = runtime_statistics.get("adaptive_cold_start_version", "dynamic-6")
+            summary["Adaptive Cold Start Mode"] = runtime_statistics.get("adaptive_cold_start_mode", "dynamic")
+            summary["Adaptive Cold Start Time Sec"] = float(runtime_statistics.get("adaptive_cold_start_time_sec", 0.0))
+            summary["Adaptive Cold Start Requested Configs"] = int(runtime_statistics.get("adaptive_cold_start_requested_config_count", 0))
+            summary["Adaptive Cold Start Merged Configs"] = int(runtime_statistics.get("adaptive_cold_start_merged_config_count", 0))
+            summary["Adaptive Cold Start Raw Steps"] = int(runtime_statistics.get("adaptive_cold_start_raw_step_count", 0))
+            summary["Adaptive Cold Start Effective Steps"] = int(runtime_statistics.get("adaptive_cold_start_effective_step_count", 0))
+            summary["Adaptive Cold Start Raw New Tokens"] = int(runtime_statistics.get("adaptive_cold_start_raw_new_tokens", 0))
+            summary["Adaptive Cold Start Raw Draft Tokens"] = int(runtime_statistics.get("adaptive_cold_start_raw_draft_tokens", 0))
+            if "adaptive_cold_start_mean_accepted_tokens" in runtime_statistics:
+                summary["Adaptive Cold Start Mean Accepted Tokens"] = float(runtime_statistics["adaptive_cold_start_mean_accepted_tokens"])
+            if "adaptive_cold_start_token_acceptance_rate" in runtime_statistics:
+                summary["Adaptive Cold Start Token Acceptance Rate"] = float(runtime_statistics["adaptive_cold_start_token_acceptance_rate"])
+            if "adaptive_cold_start_dynamic_switches" in runtime_statistics:
+                summary["Adaptive Cold Start Dynamic Switches"] = int(runtime_statistics["adaptive_cold_start_dynamic_switches"])
+            if "adaptive_cold_start_dynamic_layer_switches" in runtime_statistics:
+                summary["Adaptive Cold Start Dynamic Layer Switches"] = int(runtime_statistics["adaptive_cold_start_dynamic_layer_switches"])
+            if "adaptive_cold_start_final2_action_counts" in runtime_statistics:
+                summary["Adaptive Cold Start Final2 Action Counts"] = runtime_statistics["adaptive_cold_start_final2_action_counts"]
+            if "adaptive_cold_start_ratio_step_counts" in runtime_statistics:
+                summary["Adaptive Cold Start Ratio Step Counts"] = runtime_statistics["adaptive_cold_start_ratio_step_counts"]
+            if "adaptive_cold_start_final_ratio_counts" in runtime_statistics:
+                summary["Adaptive Cold Start Final Ratio Counts"] = runtime_statistics["adaptive_cold_start_final_ratio_counts"]
         summary["Lyapunov Adaptive Controller"] = bool(runtime_statistics.get("lyapunov_adaptive_controller", False))
         summary["Lyapunov Acceptance Target"] = float(runtime_statistics.get("lyapunov_acceptance_target", 0.92))
         summary["Lyapunov V"] = float(runtime_statistics.get("lyapunov_v", 0.1))
@@ -1412,6 +1439,8 @@ def get_model_answers(
         print("Adaptive Total Switches:", summary["Adaptive Total Switches"])
     if "Adaptive Step Config Count" in summary:
         print("Adaptive Step Config Count:", summary["Adaptive Step Config Count"])
+    if "Adaptive Cold Start Time Sec" in summary:
+        print("Adaptive Cold Start Time Sec:", summary["Adaptive Cold Start Time Sec"])
     if "Accuracy" in summary:
         print("Accuracy:", summary["Accuracy"])
     if "Exact Match" in summary:

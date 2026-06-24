@@ -370,6 +370,7 @@ def initialize_swift(input_ids, model, max_new_tokens, past_key_values, past_key
             max_new_tokens=max_new_tokens,
             logits_processor=logits_processor,
             draft_token_num=draft_token_num,
+            statistics=statistics,
         )
     return swift_logits, sample_token, top1_prob
 
@@ -432,6 +433,16 @@ def _copy_past_key_values(model, past_key_values_data, current_length_data):
         model, draft_past_key_values_data, draft_current_length_data
     )
     return draft_past_key_values_data, draft_current_length_data, draft_past_key_values
+
+
+def _share_past_key_values(model, past_key_values_data, current_length_data, current_length=None):
+    draft_current_length_data = current_length_data.clone()
+    if current_length is not None:
+        draft_current_length_data.fill_(int(current_length))
+    draft_past_key_values = clone_past_key_values(
+        model, past_key_values_data, draft_current_length_data
+    )
+    return past_key_values_data, draft_current_length_data, draft_past_key_values
 
 
 def _pool_token_scores(scores, kernel_size=SMART_KV_POOL_KERNEL):
@@ -565,10 +576,14 @@ def _select_smart_kv_indices(
     if remaining > 0:
         candidate_indices = torch.nonzero(~keep_mask, as_tuple=True)[0]
         if scores is not None and scores.numel() == full_len:
+            # The adaptive controller chooses the KV budget; attention scores
+            # only rank which middle tokens should fill that budget.
             candidate_scores = scores.to(device=device)[candidate_indices]
             topk = min(remaining, candidate_indices.numel())
             selected = candidate_indices[torch.topk(candidate_scores, k=topk).indices]
         else:
+            # No attention statistics are available on the first decode step,
+            # so use a deterministic spread through the non-sink/non-recent span.
             selected = _fill_indices_evenly(candidate_indices, remaining)
         keep_mask[selected] = True
 
@@ -598,6 +613,41 @@ def _copy_selected_kv_cache(model, past_key_values_data, current_length_data, ke
     return draft_past_key_values_data, draft_current_length_data, draft_past_key_values
 
 
+def _build_masked_draft_attention_mask(model, past_key_values, input_ids):
+    keep_indices = getattr(model, "draft_kv_mask_keep_indices", None)
+    full_len = int(getattr(model, "draft_kv_mask_full_len", 0) or 0)
+    if keep_indices is None or full_len <= 0 or input_ids is None:
+        return None
+
+    past_len = 0
+    if past_key_values is not None:
+        for past_key_value in past_key_values:
+            if past_key_value is not None:
+                past_len = int(past_key_value[0].shape[2])
+                break
+
+    total_len = past_len + int(input_ids.shape[1])
+    if total_len <= 0:
+        return None
+
+    attention_mask = torch.zeros(
+        (input_ids.shape[0], total_len),
+        dtype=torch.bool,
+        device=input_ids.device,
+    )
+    local_keep_indices = keep_indices.to(device=input_ids.device)
+    valid = (local_keep_indices >= 0) & (local_keep_indices < min(full_len, total_len))
+    if valid.any().item():
+        attention_mask[:, local_keep_indices[valid]] = True
+
+    # Draft tokens appended after the original context must remain mutually visible
+    # through the normal causal mask; only old, unselected context tokens are hidden.
+    if total_len > full_len:
+        attention_mask[:, full_len:] = True
+
+    return attention_mask
+
+
 @torch.no_grad()
 def swift_draft(
         model,
@@ -612,6 +662,7 @@ def swift_draft(
         logits_processor=None,
         stop_threshold=0.8,
         draft_token_num=None,
+        statistics=None,
 ):
     """
     Draft new tokens using the swift structure.
@@ -619,17 +670,32 @@ def swift_draft(
     # Normal draft path must not reuse a stale tree mask from the previous tree decoding round
     _clear_swift_tree_state(model)
 
+    use_draft_kv_mask = False
     if hasattr(model, "draft_kv_compress") and model.draft_kv_compress and model.draft_kv_retain_ratio < 0.9999:
-        draft_past_key_values_data, draft_current_length_data, draft_past_key_values = rebuild_compressed_draft_cache(
-            model=model,
-            full_input_ids=full_input_ids,
-            past_key_values_data=past_key_values_data,
-            current_length_data=current_length_data,
-            retain_ratio=model.draft_kv_retain_ratio,
-            min_retain_tokens=16,
-            # sink_tokens=4,
-        )
+        if _draft_kv_cache_mode(statistics) == "mask":
+            draft_past_key_values_data, draft_current_length_data, draft_past_key_values = prepare_masked_draft_cache(
+                model=model,
+                full_input_ids=full_input_ids,
+                past_key_values_data=past_key_values_data,
+                current_length_data=current_length_data,
+                retain_ratio=model.draft_kv_retain_ratio,
+                min_retain_tokens=16,
+                statistics=statistics,
+            )
+            use_draft_kv_mask = getattr(model, "draft_kv_mask_keep_indices", None) is not None
+        else:
+            draft_past_key_values_data, draft_current_length_data, draft_past_key_values = rebuild_compressed_draft_cache(
+                model=model,
+                full_input_ids=full_input_ids,
+                past_key_values_data=past_key_values_data,
+                current_length_data=current_length_data,
+                retain_ratio=model.draft_kv_retain_ratio,
+                min_retain_tokens=16,
+                statistics=statistics,
+                # sink_tokens=4,
+            )
     else:
+        _clear_draft_reuse_mapping(model)
         draft_past_key_values_data, draft_current_length_data, draft_past_key_values = _copy_past_key_values(
             model, past_key_values_data, current_length_data
         )
@@ -645,50 +711,66 @@ def swift_draft(
             raise ValueError("draft_token_num must be a positive integer when set.")
         max_step_draft = min(max_step_draft, draft_token_num)
 
-    with torch.inference_mode():
-        for step_draft in range(max_step_draft):
-            step_position_ids = position_ids
-            if step_position_ids is None and draft_position is not None:
-                step_position_ids = torch.arange(
-                    draft_position,
-                    draft_position + input_ids.shape[1],
-                    dtype=torch.long,
-                    device=input_ids.device,
-                ).unsqueeze(0)
+    collect_draft_scores = (
+        _draft_kv_score_source(statistics) == "reuse"
+        and getattr(model, "draft_kv_last_keep_indices", None) is not None
+    )
+    if collect_draft_scores:
+        _start_draft_attention_collection(model)
 
-            with model.self_draft():
-                draft_outputs = model.model(
-                    input_ids=input_ids,
-                    attention_mask=None,
-                    past_key_values=draft_past_key_values,
-                    position_ids=step_position_ids,
-                )
-            current_draft_logits = model.lm_head(draft_outputs[0])
+    try:
+        with torch.inference_mode():
+            for step_draft in range(max_step_draft):
+                step_position_ids = position_ids
+                if step_position_ids is None and draft_position is not None:
+                    step_position_ids = torch.arange(
+                        draft_position,
+                        draft_position + input_ids.shape[1],
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    ).unsqueeze(0)
 
-            if logits_processor is not None:
-                topk_index, topk_prob, op = sample(current_draft_logits, logits_processor, k=TOPK)
-                input_ids = topk_index[:, 0].unsqueeze(0)
-            else:
-                top = torch.topk(current_draft_logits, TOPK, dim=-1)
-                topk_index, topk_prob = top.indices, top.values
-                input_ids = topk_index[:, :, 0]
-                op = None
+                with model.self_draft():
+                    draft_attention_mask = (
+                        _build_masked_draft_attention_mask(model, draft_past_key_values, input_ids)
+                        if use_draft_kv_mask
+                        else None
+                    )
+                    draft_outputs = model.model(
+                        input_ids=input_ids,
+                        attention_mask=draft_attention_mask,
+                        past_key_values=draft_past_key_values,
+                        position_ids=step_position_ids,
+                    )
+                current_draft_logits = model.lm_head(draft_outputs[0])
 
-            ss_token.append(topk_index)
-            ss_prob.append(topk_prob)
-            ss_op.append(op)
+                if logits_processor is not None:
+                    topk_index, topk_prob, op = sample(current_draft_logits, logits_processor, k=TOPK)
+                    input_ids = topk_index[:, 0].unsqueeze(0)
+                else:
+                    top = torch.topk(current_draft_logits, TOPK, dim=-1)
+                    topk_index, topk_prob = top.indices, top.values
+                    input_ids = topk_index[:, :, 0]
+                    op = None
 
-            origin_draft_probs = current_draft_logits.softmax(-1)
-            argmax_prob = torch.gather(origin_draft_probs, -1, input_ids.unsqueeze(-1)).squeeze(-1)
-            current_threshold = argmax_prob.item()
-            top1_prob.append(current_threshold)
+                ss_token.append(topk_index)
+                ss_prob.append(topk_prob)
+                ss_op.append(op)
 
-            reached_generation_limit = new_token_num + step_draft + 2 >= max_new_tokens
-            if reached_generation_limit or (not use_fixed_draft_tokens and current_threshold < stop_threshold):
-                break
+                origin_draft_probs = current_draft_logits.softmax(-1)
+                argmax_prob = torch.gather(origin_draft_probs, -1, input_ids.unsqueeze(-1)).squeeze(-1)
+                current_threshold = argmax_prob.item()
+                top1_prob.append(current_threshold)
 
-            if draft_position is not None:
-                draft_position += input_ids.shape[1]
+                reached_generation_limit = new_token_num + step_draft + 2 >= max_new_tokens
+                if reached_generation_limit or (not use_fixed_draft_tokens and current_threshold < stop_threshold):
+                    break
+
+                if draft_position is not None:
+                    draft_position += input_ids.shape[1]
+    finally:
+        if collect_draft_scores:
+            _finish_draft_attention_collection(model, statistics=statistics)
 
     return (torch.cat(ss_token), torch.cat(ss_prob), ss_op), top1_prob
 
@@ -717,6 +799,175 @@ def _finish_attn_cosine_collection(model):
             scores.append(float(score.float().cpu().item()))
         layer.last_attn_cosine = None
     return scores
+
+
+def _draft_kv_score_source(statistics):
+    if statistics is None:
+        return "heuristic"
+    return statistics.get("draft_kv_score_source", "heuristic")
+
+
+def _draft_kv_cache_mode(statistics):
+    if statistics is None:
+        return "copy"
+    return statistics.get("draft_kv_cache_mode", "copy")
+
+
+def _increment_stat(statistics, key):
+    if statistics is not None:
+        statistics[key] = int(statistics.get(key, 0)) + 1
+
+
+def _clear_draft_reuse_mapping(model):
+    model.draft_kv_last_keep_indices = None
+    model.draft_kv_last_full_len = 0
+    model.draft_kv_last_cache_mode = None
+    model.draft_kv_mask_keep_indices = None
+    model.draft_kv_mask_full_len = 0
+
+
+def reset_draft_attention_reuse(model):
+    model.draft_kv_reuse_scores = None
+    model.draft_kv_reuse_scores_len = 0
+    model.draft_kv_pending_attention_scores = None
+    model.draft_kv_pending_attention_scores_len = 0
+    _clear_draft_reuse_mapping(model)
+    for layer in getattr(model.model, "layers", []):
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            continue
+        attn.collect_draft_attn_scores = False
+        attn.draft_attn_score_sum = None
+        attn.draft_attn_score_count = 0
+
+
+def _set_draft_reuse_mapping(model, keep_indices, full_len, cache_mode="copy"):
+    model.draft_kv_last_keep_indices = keep_indices.detach()
+    model.draft_kv_last_full_len = int(full_len)
+    model.draft_kv_last_cache_mode = cache_mode
+
+
+def _get_reused_draft_attention_scores(model, full_len, device, statistics=None):
+    scores = getattr(model, "draft_kv_reuse_scores", None)
+    if scores is None or scores.numel() == 0:
+        _increment_stat(statistics, "draft_kv_reuse_score_misses")
+        return None
+
+    reused_scores = torch.zeros(full_len, dtype=torch.float32, device=device)
+    copy_len = min(int(full_len), int(scores.numel()))
+    if copy_len <= 0:
+        _increment_stat(statistics, "draft_kv_reuse_score_misses")
+        return None
+
+    reused_scores[:copy_len].copy_(scores.to(device=device, dtype=torch.float32)[:copy_len])
+    _increment_stat(statistics, "draft_kv_reuse_score_hits")
+    return reused_scores
+
+
+def _start_draft_attention_collection(model):
+    model.draft_kv_pending_attention_scores = None
+    model.draft_kv_pending_attention_scores_len = 0
+    for layer in getattr(model.model, "layers", []):
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            continue
+        attn.collect_draft_attn_scores = True
+        attn.draft_attn_score_sum = None
+        attn.draft_attn_score_count = 0
+
+
+def _finish_draft_attention_collection(model, statistics=None):
+    keep_indices = getattr(model, "draft_kv_last_keep_indices", None)
+    full_len = int(getattr(model, "draft_kv_last_full_len", 0) or 0)
+    cache_mode = getattr(model, "draft_kv_last_cache_mode", "copy")
+    if keep_indices is None or full_len <= 0:
+        return
+
+    compressed_len = int(keep_indices.numel())
+    layer_scores = []
+    for layer in getattr(model.model, "layers", []):
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            continue
+        attn.collect_draft_attn_scores = False
+        score_sum = getattr(attn, "draft_attn_score_sum", None)
+        score_count = int(getattr(attn, "draft_attn_score_count", 0) or 0)
+        if score_sum is not None and score_count > 0:
+            if cache_mode == "mask":
+                usable_len = min(full_len, int(score_sum.numel()))
+            else:
+                usable_len = min(compressed_len, int(score_sum.numel()))
+            if usable_len > 0:
+                layer_scores.append(score_sum[:usable_len].detach().float() / float(score_count))
+        attn.draft_attn_score_sum = None
+        attn.draft_attn_score_count = 0
+
+    if not layer_scores:
+        model.draft_kv_pending_attention_scores = None
+        model.draft_kv_pending_attention_scores_len = 0
+        return
+
+    usable_len = min(score.numel() for score in layer_scores)
+    device = layer_scores[0].device
+    collected_scores = torch.stack([score[:usable_len].to(device) for score in layer_scores]).mean(dim=0)
+    full_scores = torch.zeros(full_len, dtype=torch.float32, device=device)
+    if cache_mode == "mask":
+        full_scores[:usable_len] = collected_scores[:usable_len]
+    else:
+        local_keep_indices = keep_indices.to(device=device)[:usable_len]
+        valid = local_keep_indices < full_len
+        full_scores[local_keep_indices[valid]] = collected_scores[valid]
+
+    model.draft_kv_pending_attention_scores = full_scores.detach()
+    model.draft_kv_pending_attention_scores_len = full_len
+
+
+def apply_draft_attention_reuse_reward(
+        model,
+        accepted_draft_tokens,
+        drafted_tokens,
+        statistics=None,
+):
+    attention_scores = getattr(model, "draft_kv_pending_attention_scores", None)
+    full_len = int(getattr(model, "draft_kv_pending_attention_scores_len", 0) or 0)
+    if attention_scores is None or attention_scores.numel() == 0 or full_len <= 0:
+        _increment_stat(statistics, "draft_kv_reuse_score_empty_updates")
+        return False
+
+    drafted_tokens = int(drafted_tokens)
+    if drafted_tokens <= 0:
+        model.draft_kv_pending_attention_scores = None
+        model.draft_kv_pending_attention_scores_len = 0
+        _increment_stat(statistics, "draft_kv_reuse_score_empty_updates")
+        return False
+
+    accepted_draft_tokens = max(0, int(accepted_draft_tokens))
+    reward = float(accepted_draft_tokens) / float(drafted_tokens)
+
+    device = attention_scores.device
+    attention_scores = attention_scores.to(device=device, dtype=torch.float32)
+    full_len = min(full_len, int(attention_scores.numel()))
+    attention_scores = attention_scores[:full_len]
+    # Accepted draft tokens are used as a light reward signal: attention
+    # patterns from more successful drafts get ranked higher next step.
+    weighted_score = attention_scores * (0.5 + reward)
+
+    previous_full = torch.zeros_like(weighted_score)
+    previous_scores = getattr(model, "draft_kv_reuse_scores", None)
+    if previous_scores is not None and previous_scores.numel() > 0:
+        copy_len = min(int(previous_scores.numel()), full_len)
+        previous_full[:copy_len].copy_(previous_scores.to(device=device, dtype=torch.float32)[:copy_len])
+
+    full_scores = previous_full * 0.5 + weighted_score * 0.5
+    model.draft_kv_reuse_scores = full_scores.detach()
+    model.draft_kv_reuse_scores_len = full_len
+    model.draft_kv_pending_attention_scores = None
+    model.draft_kv_pending_attention_scores_len = 0
+
+    if statistics is not None:
+        statistics["draft_kv_reuse_last_reward"] = reward
+    _increment_stat(statistics, "draft_kv_reuse_score_updates")
+    return True
 
 
 def _cosine_eligible_attn_layers(num_hidden_layers, statistics):
@@ -819,37 +1070,121 @@ def rebuild_compressed_draft_cache(
         current_length_data,
         retain_ratio=1.0,
         min_retain_tokens=16,
+        statistics=None,
 ):
     """
     Rebuild a draft cache by retaining sink, recent, and attention-heavy tokens.
     """
-    if full_input_ids is None:
+    keep_indices, full_len, keep_len = _select_draft_kv_keep_indices(
+        model=model,
+        full_input_ids=full_input_ids,
+        past_key_values_data=past_key_values_data,
+        current_length_data=current_length_data,
+        retain_ratio=retain_ratio,
+        min_retain_tokens=min_retain_tokens,
+        statistics=statistics,
+    )
+    if keep_indices is None or keep_len == full_len:
+        _clear_draft_reuse_mapping(model)
         return _copy_past_key_values(model, past_key_values_data, current_length_data)
+
+    _set_draft_reuse_mapping(model, keep_indices, full_len, cache_mode="copy")
+    _increment_stat(statistics, "draft_kv_copy_cache_rebuilds")
+    return _copy_selected_kv_cache(
+        model=model,
+        past_key_values_data=past_key_values_data,
+        current_length_data=current_length_data,
+        keep_indices=keep_indices,
+    )
+
+
+def _select_draft_kv_keep_indices(
+        model,
+        full_input_ids,
+        past_key_values_data,
+        current_length_data,
+        retain_ratio=1.0,
+        min_retain_tokens=16,
+        statistics=None,
+):
+    if full_input_ids is None:
+        return None, 0, 0
 
     full_len = full_input_ids.shape[1]
     keep_len = max(min_retain_tokens, int(full_len * retain_ratio))
     keep_len = min(keep_len, full_len)
 
     if keep_len == full_len:
-        return _copy_past_key_values(model, past_key_values_data, current_length_data)
+        return torch.arange(full_len, device=full_input_ids.device, dtype=torch.long), full_len, keep_len
 
     _clear_swift_tree_state(model)
-    scores = _get_observation_attention_scores(
-        model=model,
-        full_input_ids=full_input_ids,
-        past_key_values_data=past_key_values_data,
-        current_length_data=current_length_data,
-    )
+    score_source = _draft_kv_score_source(statistics)
+    if score_source == "observation":
+        # Accurate but expensive: runs an extra observation forward pass before
+        # drafting, which is why this path is not the current default.
+        scores = _get_observation_attention_scores(
+            model=model,
+            full_input_ids=full_input_ids,
+            past_key_values_data=past_key_values_data,
+            current_length_data=current_length_data,
+        )
+    elif score_source == "reuse":
+        # Current default: reuse attention statistics collected from the
+        # previous draft instead of paying for another observation pass.
+        scores = _get_reused_draft_attention_scores(
+            model=model,
+            full_len=full_len,
+            device=full_input_ids.device,
+            statistics=statistics,
+        )
+    else:
+        scores = None
     keep_indices = _select_smart_kv_indices(
         full_input_ids=full_input_ids,
         keep_len=keep_len,
         scores=scores,
     )
-    return _copy_selected_kv_cache(
+    return keep_indices, full_len, keep_len
+
+
+def prepare_masked_draft_cache(
+        model,
+        full_input_ids,
+        past_key_values_data,
+        current_length_data,
+        retain_ratio=1.0,
+        min_retain_tokens=16,
+        statistics=None,
+):
+    """
+    Prepare a draft cache that keeps the original KV layout and masks out
+    unselected context tokens instead of physically copying selected KV.
+    """
+    keep_indices, full_len, keep_len = _select_draft_kv_keep_indices(
         model=model,
+        full_input_ids=full_input_ids,
         past_key_values_data=past_key_values_data,
         current_length_data=current_length_data,
-        keep_indices=keep_indices,
+        retain_ratio=retain_ratio,
+        min_retain_tokens=min_retain_tokens,
+        statistics=statistics,
+    )
+    if keep_indices is None or keep_len == full_len:
+        _clear_draft_reuse_mapping(model)
+        return _share_past_key_values(model, past_key_values_data, current_length_data)
+
+    _set_draft_reuse_mapping(model, keep_indices, full_len, cache_mode="mask")
+    # Mask mode avoids physically copying selected KV into a compact cache.
+    # The original KV layout remains full length and unselected old tokens are
+    # hidden by an attention mask during draft decoding.
+    model.draft_kv_mask_keep_indices = keep_indices.detach()
+    model.draft_kv_mask_full_len = int(full_len)
+    _increment_stat(statistics, "draft_kv_mask_cache_rebuilds")
+    return _share_past_key_values(
+        model,
+        past_key_values_data,
+        current_length_data,
+        current_length=full_len,
     )
 
 
@@ -1323,11 +1658,6 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
     """
     generate_ids = output_ids.clone()
 
-    cur_past_key_values_data = []
-    for i in range(len(input_past_key_values_data)):
-        cur_past_key_values_data.append(input_past_key_values_data[i].clone())
-    cur_current_length_data = input_current_length_data.clone()
-
     dynamic_retain_ratio = statistics.get("dynamic_retain_ratio", False)
     candidate_retain_ratio = statistics.get("draft_kv_retain_ratio", 1.0)
     candidate_optimizer = optimizer
@@ -1344,14 +1674,34 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
         and candidate_retain_ratio < 0.9999
     )
 
+    cache_mode = _draft_kv_cache_mode(statistics)
+    if use_compressed_optimization_kv and cache_mode == "mask":
+        cur_past_key_values_data = input_past_key_values_data
+    else:
+        cur_past_key_values_data = []
+        for i in range(len(input_past_key_values_data)):
+            cur_past_key_values_data.append(input_past_key_values_data[i].clone())
+    cur_current_length_data = input_current_length_data.clone()
+
     if use_compressed_optimization_kv:
-        cur_past_key_values_data, cur_current_length_data, input_past_key_values = rebuild_compressed_draft_cache(
-            model=model,
-            full_input_ids=full_input_ids,
-            past_key_values_data=cur_past_key_values_data,
-            current_length_data=cur_current_length_data,
-            retain_ratio=candidate_retain_ratio,
-        )
+        if cache_mode == "mask":
+            cur_past_key_values_data, cur_current_length_data, input_past_key_values = prepare_masked_draft_cache(
+                model=model,
+                full_input_ids=full_input_ids,
+                past_key_values_data=cur_past_key_values_data,
+                current_length_data=cur_current_length_data,
+                retain_ratio=candidate_retain_ratio,
+                statistics=statistics,
+            )
+        else:
+            cur_past_key_values_data, cur_current_length_data, input_past_key_values = rebuild_compressed_draft_cache(
+                model=model,
+                full_input_ids=full_input_ids,
+                past_key_values_data=cur_past_key_values_data,
+                current_length_data=cur_current_length_data,
+                retain_ratio=candidate_retain_ratio,
+                statistics=statistics,
+            )
     else:
         input_past_key_values = clone_past_key_values(model, cur_past_key_values_data, cur_current_length_data)
 
@@ -1390,9 +1740,14 @@ def swift_optimization(model, output_ids, full_input_ids, input_past_key_values_
                     device=optimization_input_ids.device,
                 ).unsqueeze(0)
 
+            optimization_attention_mask = (
+                _build_masked_draft_attention_mask(model, input_past_key_values, optimization_input_ids)
+                if use_compressed_optimization_kv and cache_mode == "mask"
+                else None
+            )
             parallel_draft_output = model.model(
                 input_ids=optimization_input_ids,
-                attention_mask=None,
+                attention_mask=optimization_attention_mask,
                 past_key_values=input_past_key_values,
                 position_ids=optimization_position_ids
             )

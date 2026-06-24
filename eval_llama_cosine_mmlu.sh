@@ -117,18 +117,24 @@ FINAL2_TOKEN_ACCEPTANCE_FLOOR=${FINAL2_TOKEN_ACCEPTANCE_FLOOR:-0.85}
 FINAL2_MORE_AGGRESSIVE_TOKEN_ACCEPTANCE_FLOOR=${FINAL2_MORE_AGGRESSIVE_TOKEN_ACCEPTANCE_FLOOR:-0.90}
 FINAL2_DRAFT_LEN_FLOOR=${FINAL2_DRAFT_LEN_FLOOR:-2.0}
 FINAL2_MORE_AGGRESSIVE_DRAFT_LEN_FLOOR=${FINAL2_MORE_AGGRESSIVE_DRAFT_LEN_FLOOR:-2.2}
-FINAL2_SOFT_MAX_SKIP_LAYERS=${FINAL2_SOFT_MAX_SKIP_LAYERS:-18}
-FINAL2_HARD_MAX_SKIP_LAYERS=${FINAL2_HARD_MAX_SKIP_LAYERS:-19}
-FINAL2_MIN_RATIO_FOR_MORE_SKIP=${FINAL2_MIN_RATIO_FOR_MORE_SKIP:-0.4}
-FINAL2_LOW_RATIO_GUARD=${FINAL2_LOW_RATIO_GUARD:-0.2}
-FINAL2_LOW_RATIO_GUARD_SKIP_LAYERS=${FINAL2_LOW_RATIO_GUARD_SKIP_LAYERS:-17}
-FINAL2_HARD_PROBE_MEAN_MARGIN=${FINAL2_HARD_PROBE_MEAN_MARGIN:-0.3}
-FINAL2_HARD_PROBE_TOKEN_ACCEPTANCE_FLOOR=${FINAL2_HARD_PROBE_TOKEN_ACCEPTANCE_FLOOR:-0.92}
-FINAL2_HARD_PROBE_DRAFT_LEN_MARGIN=${FINAL2_HARD_PROBE_DRAFT_LEN_MARGIN:-0.3}
 FINAL2_SWITCH_COST=${FINAL2_SWITCH_COST:-0.02}
 FINAL2_LAYER_SWITCH_COST=${FINAL2_LAYER_SWITCH_COST:-${FINAL2_SWITCH_COST}}
 FINAL2_RATIO_DOWN_GAIN_WEIGHT=${FINAL2_RATIO_DOWN_GAIN_WEIGHT:-1.0}
 FINAL2_LAYER_SKIP_GAIN_WEIGHT=${FINAL2_LAYER_SKIP_GAIN_WEIGHT:-2.0}
+
+# Dynamic-6 cold start is a one-time warmup before the benchmark stream.  The
+# default dynamic mode uses a task-agnostic repeat-passage prompt while final2
+# adapts, then merges weak table priors back into the real run.
+ADAPTIVE_COLD_START=${ADAPTIVE_COLD_START:-0}
+ADAPTIVE_COLD_START_MODE=${ADAPTIVE_COLD_START_MODE:-dynamic}
+ADAPTIVE_COLD_START_PROMPT=${ADAPTIVE_COLD_START_PROMPT:-auto}
+ADAPTIVE_COLD_START_MAX_NEW_TOKENS=${ADAPTIVE_COLD_START_MAX_NEW_TOKENS:-192}
+ADAPTIVE_COLD_START_MAX_STEPS=${ADAPTIVE_COLD_START_MAX_STEPS:-192}
+ADAPTIVE_COLD_START_EFFECTIVE_COUNT=${ADAPTIVE_COLD_START_EFFECTIVE_COUNT:-16}
+ADAPTIVE_COLD_START_MAX_CONFIGS=${ADAPTIVE_COLD_START_MAX_CONFIGS:-12}
+ADAPTIVE_COLD_START_RATIOS=${ADAPTIVE_COLD_START_RATIOS-}
+ADAPTIVE_COLD_START_SKIP_COUNTS=${ADAPTIVE_COLD_START_SKIP_COUNTS-}
+ADAPTIVE_COLD_START_SKIP_DELTA=${ADAPTIVE_COLD_START_SKIP_DELTA:-2}
 
 case "${LYAPUNOV_ADAPTIVE,,}" in
   1|true|yes|on)
@@ -182,7 +188,34 @@ case "${FINAL2_ADAPTIVE,,}" in
     ;;
 esac
 
-if [ "${FINAL2_ADAPTIVE_STATUS}" = "enabled" ]; then
+case "${ADAPTIVE_COLD_START,,}" in
+  1|true|yes|on)
+    ADAPTIVE_COLD_START_STATUS="enabled"
+    ;;
+  0|false|no|off)
+    ADAPTIVE_COLD_START_STATUS="disabled"
+    ;;
+  *)
+    echo "ADAPTIVE_COLD_START must be one of 1/0, true/false, yes/no, on/off." >&2
+    exit 1
+    ;;
+esac
+
+case "${ADAPTIVE_COLD_START_MODE}" in
+  dynamic|probe)
+    ;;
+  *)
+    echo "ADAPTIVE_COLD_START_MODE must be one of dynamic or probe." >&2
+    exit 1
+    ;;
+esac
+
+if [ "${ADAPTIVE_COLD_START_STATUS}" = "enabled" ]; then
+  FINAL2_ADAPTIVE_STATUS="enabled"
+  AGGRESSIVE_ADAPTIVE_STATUS="disabled"
+  FINAL_ADAPTIVE_STATUS="disabled"
+  LYAPUNOV_ADAPTIVE_STATUS="disabled"
+elif [ "${FINAL2_ADAPTIVE_STATUS}" = "enabled" ]; then
   AGGRESSIVE_ADAPTIVE_STATUS="disabled"
   FINAL_ADAPTIVE_STATUS="disabled"
   LYAPUNOV_ADAPTIVE_STATUS="disabled"
@@ -216,7 +249,40 @@ COSINE_MAX_SKIP_LAYERS=${COSINE_MAX_SKIP_LAYERS-}
 COSINE_KEEP_FIRST_LAYERS=${COSINE_KEEP_FIRST_LAYERS:-1}
 COSINE_KEEP_LAST_LAYERS=${COSINE_KEEP_LAST_LAYERS:-2}
 COSINE_MLP_INTERVAL=${COSINE_MLP_INTERVAL:-0}
+
+# Draft KV compression defaults to reuse+mask.  Reuse keeps attention-heavy
+# token selection without the extra observation forward pass; mask avoids
+# physically copying KV, while still using the selected indices as visibility.
+DRAFT_KV_SCORE_SOURCE=${DRAFT_KV_SCORE_SOURCE:-reuse}
+DRAFT_KV_CACHE_MODE=${DRAFT_KV_CACHE_MODE:-mask}
+DRAFT_KV_REUSE_EMA=${DRAFT_KV_REUSE_EMA:-0.7}
+WRITE_LOG=${WRITE_LOG:-1}
+
+case "${DRAFT_KV_CACHE_MODE}" in
+  copy|mask)
+    ;;
+  *)
+    echo "DRAFT_KV_CACHE_MODE must be one of copy or mask." >&2
+    exit 1
+    ;;
+esac
+
+case "${WRITE_LOG,,}" in
+  1|true|yes|on)
+    WRITE_LOG_STATUS="enabled"
+    ;;
+  0|false|no|off)
+    WRITE_LOG_STATUS="disabled"
+    ;;
+  *)
+    echo "WRITE_LOG must be one of 1/0, true/false, yes/no, on/off." >&2
+    exit 1
+    ;;
+esac
 LOCAL_ADAPTIVE_CONTROLLER=${LOCAL_ADAPTIVE_CONTROLLER:-1}
+if [ "${ADAPTIVE_COLD_START_STATUS}" = "enabled" ]; then
+  LOCAL_ADAPTIVE_CONTROLLER=1
+fi
 ADAPTIVE_LAYER_CONTROLLER=${ADAPTIVE_LAYER_CONTROLLER:-1}
 ADAPTIVE_LAYER_FALLBACK_WINDOW=${ADAPTIVE_LAYER_FALLBACK_WINDOW:-16}
 ADAPTIVE_LAYER_IMPROVEMENT_DELTA=${ADAPTIVE_LAYER_IMPROVEMENT_DELTA:-0.0}
@@ -263,10 +329,34 @@ esac
 
 case "${FINAL2_ADAPTIVE_STATUS}" in
   enabled)
-    FINAL2_ADAPTIVE_ARG="--adaptive-final2-controller --adaptive-min-retain-ratio ${ADAPTIVE_MIN_RETAIN_RATIO} --adaptive-ratio-step ${ADAPTIVE_RATIO_STEP} --final2-low-std-k ${FINAL2_LOW_STD_K} --final2-high-std-k ${FINAL2_HIGH_STD_K} --final2-mean-std-floor ${FINAL2_MEAN_STD_FLOOR} --final2-min-config-observations ${FINAL2_MIN_CONFIG_OBSERVATIONS} --final2-prediction-beta ${FINAL2_PREDICTION_BETA} --final2-ratio-mean-slope ${FINAL2_RATIO_MEAN_SLOPE} --final2-layer-mean-slope ${FINAL2_LAYER_MEAN_SLOPE} --final2-cold-start-penalty ${FINAL2_COLD_START_PENALTY} --final2-token-acceptance-floor ${FINAL2_TOKEN_ACCEPTANCE_FLOOR} --final2-more-aggressive-token-acceptance-floor ${FINAL2_MORE_AGGRESSIVE_TOKEN_ACCEPTANCE_FLOOR} --final2-draft-len-floor ${FINAL2_DRAFT_LEN_FLOOR} --final2-more-aggressive-draft-len-floor ${FINAL2_MORE_AGGRESSIVE_DRAFT_LEN_FLOOR} --final2-soft-max-skip-layers ${FINAL2_SOFT_MAX_SKIP_LAYERS} --final2-hard-max-skip-layers ${FINAL2_HARD_MAX_SKIP_LAYERS} --final2-min-ratio-for-more-skip ${FINAL2_MIN_RATIO_FOR_MORE_SKIP} --final2-low-ratio-guard ${FINAL2_LOW_RATIO_GUARD} --final2-low-ratio-guard-skip-layers ${FINAL2_LOW_RATIO_GUARD_SKIP_LAYERS} --final2-hard-probe-mean-margin ${FINAL2_HARD_PROBE_MEAN_MARGIN} --final2-hard-probe-token-acceptance-floor ${FINAL2_HARD_PROBE_TOKEN_ACCEPTANCE_FLOOR} --final2-hard-probe-draft-len-margin ${FINAL2_HARD_PROBE_DRAFT_LEN_MARGIN} --final2-switch-cost ${FINAL2_SWITCH_COST} --final2-layer-switch-cost ${FINAL2_LAYER_SWITCH_COST} --final2-ratio-down-gain-weight ${FINAL2_RATIO_DOWN_GAIN_WEIGHT} --final2-layer-skip-gain-weight ${FINAL2_LAYER_SKIP_GAIN_WEIGHT}"
+    FINAL2_ADAPTIVE_ARG="--adaptive-final2-controller --adaptive-min-retain-ratio ${ADAPTIVE_MIN_RETAIN_RATIO} --adaptive-ratio-step ${ADAPTIVE_RATIO_STEP} --final2-low-std-k ${FINAL2_LOW_STD_K} --final2-high-std-k ${FINAL2_HIGH_STD_K} --final2-mean-std-floor ${FINAL2_MEAN_STD_FLOOR} --final2-min-config-observations ${FINAL2_MIN_CONFIG_OBSERVATIONS} --final2-prediction-beta ${FINAL2_PREDICTION_BETA} --final2-ratio-mean-slope ${FINAL2_RATIO_MEAN_SLOPE} --final2-layer-mean-slope ${FINAL2_LAYER_MEAN_SLOPE} --final2-cold-start-penalty ${FINAL2_COLD_START_PENALTY} --final2-token-acceptance-floor ${FINAL2_TOKEN_ACCEPTANCE_FLOOR} --final2-more-aggressive-token-acceptance-floor ${FINAL2_MORE_AGGRESSIVE_TOKEN_ACCEPTANCE_FLOOR} --final2-draft-len-floor ${FINAL2_DRAFT_LEN_FLOOR} --final2-more-aggressive-draft-len-floor ${FINAL2_MORE_AGGRESSIVE_DRAFT_LEN_FLOOR} --final2-switch-cost ${FINAL2_SWITCH_COST} --final2-layer-switch-cost ${FINAL2_LAYER_SWITCH_COST} --final2-ratio-down-gain-weight ${FINAL2_RATIO_DOWN_GAIN_WEIGHT} --final2-layer-skip-gain-weight ${FINAL2_LAYER_SKIP_GAIN_WEIGHT}"
     ;;
   disabled)
     FINAL2_ADAPTIVE_ARG=""
+    ;;
+esac
+
+ADAPTIVE_COLD_START_ARGS=()
+case "${ADAPTIVE_COLD_START_STATUS}" in
+  enabled)
+    ADAPTIVE_COLD_START_ARGS=(
+      --adaptive-cold-start
+      --adaptive-cold-start-mode "${ADAPTIVE_COLD_START_MODE}"
+      --adaptive-cold-start-prompt "${ADAPTIVE_COLD_START_PROMPT}"
+      --adaptive-cold-start-max-new-tokens "${ADAPTIVE_COLD_START_MAX_NEW_TOKENS}"
+      --adaptive-cold-start-max-steps "${ADAPTIVE_COLD_START_MAX_STEPS}"
+      --adaptive-cold-start-effective-count "${ADAPTIVE_COLD_START_EFFECTIVE_COUNT}"
+      --adaptive-cold-start-max-configs "${ADAPTIVE_COLD_START_MAX_CONFIGS}"
+      --adaptive-cold-start-skip-delta "${ADAPTIVE_COLD_START_SKIP_DELTA}"
+    )
+    if [ -n "${ADAPTIVE_COLD_START_RATIOS}" ]; then
+      ADAPTIVE_COLD_START_ARGS+=(--adaptive-cold-start-ratios "${ADAPTIVE_COLD_START_RATIOS}")
+    fi
+    if [ -n "${ADAPTIVE_COLD_START_SKIP_COUNTS}" ]; then
+      ADAPTIVE_COLD_START_ARGS+=(--adaptive-cold-start-skip-counts "${ADAPTIVE_COLD_START_SKIP_COUNTS}")
+    fi
+    ;;
+  disabled)
     ;;
 esac
 
@@ -331,12 +421,19 @@ if [ -n "${COSINE_MAX_SKIP_LAYERS}" ]; then
   COSINE_MAX_SKIP_SUFFIX="-cosine_max_skip_layers-${COSINE_MAX_SKIP_LAYERS}"
 fi
 
-if [ "${LYAPUNOV_ADAPTIVE_STATUS}" = "enabled" ]; then
+if [ "${ADAPTIVE_COLD_START_STATUS}" = "enabled" ]; then
+  RETAIN_RATIO_RUN_NAME="dynamic-6"
+elif [ "${LYAPUNOV_ADAPTIVE_STATUS}" = "enabled" ]; then
   RETAIN_RATIO_RUN_NAME="dynamic-5${ADAPTIVE_MODE_SUFFIX}"
 else
   RETAIN_RATIO_RUN_NAME="dynamic-4${ADAPTIVE_MODE_SUFFIX}"
 fi
-MODEL_RUN_NAME="${MODEL_NAME}-swift-${torch_dtype}-temp-${TEMP}-top-p-${TOP_P}-seed-${SEED}-max_new_tokens-${MAX_NEW_TOKENS}-opt_interval-${OPT_INTERVAL}-max_score-${MAX_SCORE}-context_window-${CONTEXT_WINDOW}-skip_ratio-${SKIP_RATIO}-draft_kv_retain_ratio-${RETAIN_RATIO_RUN_NAME}-opt_compressed_draft_kv-True${DRAFT_TOKEN_SUFFIX}"
+DRAFT_KV_SCORE_SUFFIX="-kvsrc-${DRAFT_KV_SCORE_SOURCE}"
+DRAFT_KV_CACHE_SUFFIX=""
+if [ "${DRAFT_KV_CACHE_MODE}" = "mask" ]; then
+  DRAFT_KV_CACHE_SUFFIX="-kvmask"
+fi
+MODEL_RUN_NAME="${MODEL_NAME}-swift-${torch_dtype}-temp-${TEMP}-top-p-${TOP_P}-seed-${SEED}-max_new_tokens-${MAX_NEW_TOKENS}-opt_interval-${OPT_INTERVAL}-max_score-${MAX_SCORE}-context_window-${CONTEXT_WINDOW}-skip_ratio-${SKIP_RATIO}-draft_kv_retain_ratio-${RETAIN_RATIO_RUN_NAME}-opt_compressed_draft_kv-True${DRAFT_KV_CACHE_SUFFIX}${DRAFT_KV_SCORE_SUFFIX}${DRAFT_TOKEN_SUFFIX}"
 ANSWER_FILE="outputs/${TASK_NAME}/${TASK_NAME}_${DATA_NUM}/without_layerskip_draft_model_answer/${MODEL_NAME}/${MODEL_RUN_NAME}.jsonl"
 LOG_FILE="${ANSWER_FILE%.jsonl}.log"
 
@@ -402,8 +499,12 @@ echo "Aggressive adaptive: ${AGGRESSIVE_ADAPTIVE_STATUS}"
 echo "Final adaptive: ${FINAL_ADAPTIVE_STATUS}"
 echo "Final2 adaptive: ${FINAL2_ADAPTIVE_STATUS}"
 echo "Lyapunov adaptive: ${LYAPUNOV_ADAPTIVE_STATUS}"
+echo "Adaptive cold start: ${ADAPTIVE_COLD_START_STATUS}"
 echo "Adaptive layer fallback: ${ADAPTIVE_LAYER_STATUS}"
 echo "Adaptive ratio ladder: ${ADAPTIVE_RATIO_LADDER}"
+echo "Draft KV cache mode: ${DRAFT_KV_CACHE_MODE}"
+echo "Draft KV score source: ${DRAFT_KV_SCORE_SOURCE}, reuse EMA: ${DRAFT_KV_REUSE_EMA}"
+echo "Write log: ${WRITE_LOG_STATUS}"
 if [ "${LYAPUNOV_ADAPTIVE_STATUS}" = "enabled" ]; then
   echo "Lyapunov target=${LYAPUNOV_ACCEPTANCE_TARGET}, V=${LYAPUNOV_V}, switch_cost=${LYAPUNOV_SWITCH_COST}, layer_penalty=${LYAPUNOV_LAYER_PENALTY_WEIGHT}"
 fi
@@ -411,38 +512,57 @@ if [ "${FINAL_ADAPTIVE_STATUS}" = "enabled" ]; then
   echo "Final target_mean=${FINAL_TARGET_MEAN_ACCEPTED}, bad_mean=${FINAL_BAD_MEAN_ACCEPTED}, soft_skip=${FINAL_SOFT_MAX_SKIP_LAYERS}, hard_skip=${FINAL_HARD_MAX_SKIP_LAYERS}"
 fi
 if [ "${FINAL2_ADAPTIVE_STATUS}" = "enabled" ]; then
-  echo "Final2 low_std_k=${FINAL2_LOW_STD_K}, high_std_k=${FINAL2_HIGH_STD_K}, min_config_obs=${FINAL2_MIN_CONFIG_OBSERVATIONS}, soft_skip=${FINAL2_SOFT_MAX_SKIP_LAYERS}, hard_skip=${FINAL2_HARD_MAX_SKIP_LAYERS}"
+  echo "Final2 low_std_k=${FINAL2_LOW_STD_K}, high_std_k=${FINAL2_HIGH_STD_K}, min_config_obs=${FINAL2_MIN_CONFIG_OBSERVATIONS}"
+fi
+if [ "${ADAPTIVE_COLD_START_STATUS}" = "enabled" ]; then
+  echo "Cold start mode=${ADAPTIVE_COLD_START_MODE}, configs=${ADAPTIVE_COLD_START_MAX_CONFIGS}, max_new_tokens=${ADAPTIVE_COLD_START_MAX_NEW_TOKENS}, effective_count=${ADAPTIVE_COLD_START_EFFECTIVE_COUNT}"
 fi
 echo "Output to ${ANSWER_FILE}"
-echo "Log to ${LOG_FILE}"
+if [ "${WRITE_LOG_STATUS}" = "enabled" ]; then
+  echo "Log to ${LOG_FILE}"
+else
+  echo "Log disabled; set WRITE_LOG=1 to write ${LOG_FILE}"
+fi
 
-PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation_llama.inference_swift \
-  --model-path "${MODEL_PATH}" \
-  --model-id "${MODEL_NAME}" \
-  --answer-file "${ANSWER_FILE}" \
-  --temperature "${TEMP}" \
-  --top-p "${TOP_P}" \
-  --dtype "${torch_dtype}" \
-  --task-name "${TASK_NAME}" \
-  --data-num "${DATA_NUM}" \
-  --max-new-tokens "${MAX_NEW_TOKENS}" \
-  --seed "${SEED}" \
-  --context-window "${CONTEXT_WINDOW}" \
-  --opt-interval "${OPT_INTERVAL}" \
-  --bayes-interval "${BAYES_INTERVAL}" \
-  --max-opt-iter "${MAX_OPT_ITER}" \
-  --max-tolerance-iter "${MAX_TOLERANCE_ITER}" \
-  --max-score "${MAX_SCORE}" \
-  --skip-ratio "${SKIP_RATIO}" \
-  ${DRAFT_TOKEN_ARG} \
-  --draft-kv-compress \
-  --draft-kv-retain-ratio "${RETAIN_RATIO}" \
-  --optimize-with-compressed-draft-kv \
-  --cosine-prefill-skip-layers \
-  --cosine-skip-mode "${COSINE_SKIP_MODE}" \
-  --cosine-attn-alpha "${COSINE_ATTN_ALPHA}" \
-  ${COSINE_MAX_SKIP_ARG} \
-  --cosine-keep-first-layers "${COSINE_KEEP_FIRST_LAYERS}" \
-  --cosine-keep-last-layers "${COSINE_KEEP_LAST_LAYERS}" \
-  --cosine-mlp-interval "${COSINE_MLP_INTERVAL}" \
-  ${LOCAL_ADAPTIVE_ARG} 2>&1 | tee "${LOG_FILE}"
+run_swift_eval() {
+  PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=${GPU_DEVICES} python -m evaluation_llama.inference_swift \
+    --model-path "${MODEL_PATH}" \
+    --model-id "${MODEL_NAME}" \
+    --answer-file "${ANSWER_FILE}" \
+    --temperature "${TEMP}" \
+    --top-p "${TOP_P}" \
+    --dtype "${torch_dtype}" \
+    --task-name "${TASK_NAME}" \
+    --data-num "${DATA_NUM}" \
+    --max-new-tokens "${MAX_NEW_TOKENS}" \
+    --seed "${SEED}" \
+    --context-window "${CONTEXT_WINDOW}" \
+    --opt-interval "${OPT_INTERVAL}" \
+    --bayes-interval "${BAYES_INTERVAL}" \
+    --max-opt-iter "${MAX_OPT_ITER}" \
+    --max-tolerance-iter "${MAX_TOLERANCE_ITER}" \
+    --max-score "${MAX_SCORE}" \
+    --skip-ratio "${SKIP_RATIO}" \
+    ${DRAFT_TOKEN_ARG} \
+    --draft-kv-compress \
+    --draft-kv-retain-ratio "${RETAIN_RATIO}" \
+    --draft-kv-cache-mode "${DRAFT_KV_CACHE_MODE}" \
+    --draft-kv-score-source "${DRAFT_KV_SCORE_SOURCE}" \
+    --draft-kv-reuse-ema "${DRAFT_KV_REUSE_EMA}" \
+    --optimize-with-compressed-draft-kv \
+    --cosine-prefill-skip-layers \
+    --cosine-skip-mode "${COSINE_SKIP_MODE}" \
+    --cosine-attn-alpha "${COSINE_ATTN_ALPHA}" \
+    ${COSINE_MAX_SKIP_ARG} \
+    --cosine-keep-first-layers "${COSINE_KEEP_FIRST_LAYERS}" \
+    --cosine-keep-last-layers "${COSINE_KEEP_LAST_LAYERS}" \
+    --cosine-mlp-interval "${COSINE_MLP_INTERVAL}" \
+    "${ADAPTIVE_COLD_START_ARGS[@]}" \
+    ${LOCAL_ADAPTIVE_ARG}
+}
+
+if [ "${WRITE_LOG_STATUS}" = "enabled" ]; then
+  run_swift_eval 2>&1 | tee "${LOG_FILE}"
+else
+  run_swift_eval
+fi
