@@ -211,6 +211,22 @@ class LlamaAttention(_LlamaAttention):
                     self.draft_attn_score_sum = score_sum
                 score_sum[: draft_scores.numel()].add_(draft_scores)
                 self.draft_attn_score_count = int(getattr(self, "draft_attn_score_count", 0)) + 1
+        if (not enabled_draft) and getattr(self, "collect_verify_attn_scores", False):
+            with torch.no_grad():
+                verify_scores = attn_weights.detach().mean(dim=(0, 1, 2)).to(torch.float32)
+                score_sum = getattr(self, "verify_attn_score_sum", None)
+                if score_sum is None or score_sum.numel() < verify_scores.numel():
+                    next_score_sum = torch.zeros(
+                        verify_scores.numel(),
+                        dtype=torch.float32,
+                        device=verify_scores.device,
+                    )
+                    if score_sum is not None:
+                        next_score_sum[: score_sum.numel()].copy_(score_sum.to(verify_scores.device))
+                    score_sum = next_score_sum
+                    self.verify_attn_score_sum = score_sum
+                score_sum[: verify_scores.numel()].add_(verify_scores)
+                self.verify_attn_score_count = int(getattr(self, "verify_attn_score_count", 0)) + 1
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):

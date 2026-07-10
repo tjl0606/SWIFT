@@ -67,6 +67,108 @@ def summarize_adaptive_step_config_stats(config_stats):
     return rows
 
 
+def set_flops_trace_context(runtime_statistics, question_idx, question_id=None, turn_idx=None):
+    if not runtime_statistics or not runtime_statistics.get("flops_trace_enabled", False):
+        return
+    runtime_statistics["flops_trace_phase"] = "eval"
+    runtime_statistics["flops_trace_question_index"] = int(question_idx)
+    runtime_statistics["flops_trace_question_id"] = (
+        int(question_id)
+        if isinstance(question_id, (int, np.integer))
+        else (str(question_id) if question_id is not None else int(question_idx))
+    )
+    runtime_statistics["flops_trace_turn_index"] = (
+        int(turn_idx)
+        if turn_idx is not None
+        else None
+    )
+
+
+def add_flops_trace_summary(summary, runtime_statistics):
+    if not runtime_statistics or not runtime_statistics.get("flops_trace_enabled", False):
+        return
+
+    components = ("prefill", "draft", "verify", "safe_commit")
+    generated_tokens = int(runtime_statistics.get("flops_trace_generated_token_count", 0))
+    summary["FLOPs Trace Enabled"] = True
+    summary["FLOPs Trace File"] = runtime_statistics.get("flops_trace_file")
+    summary["FLOPs Trace Samples"] = int(runtime_statistics.get("flops_trace_sample_count", 0))
+    summary["FLOPs Trace Steps"] = int(runtime_statistics.get("flops_trace_step_count", 0))
+    summary["FLOPs Trace Generated Tokens"] = generated_tokens
+    summary["FLOPs Trace Draft Tokens"] = int(runtime_statistics.get("flops_trace_draft_token_count", 0))
+    summary["FLOPs Trace Accepted Draft Tokens"] = int(runtime_statistics.get("flops_trace_accepted_draft_token_count", 0))
+    summary["FLOPs Trace Verify Approx Steps"] = int(runtime_statistics.get("flops_trace_verify_approx_steps", 0))
+
+    for mode in ("logical", "physical"):
+        core_total = 0
+        core_plus_lm_head_total = 0
+        cold_core_total = 0
+        cold_core_plus_lm_head_total = 0
+        breakdown = {}
+        cold_breakdown = {}
+        for component in components:
+            core_key = f"flops_estimated_{component}_{mode}_core_sum"
+            total_key = f"flops_estimated_{component}_{mode}_core_plus_lm_head_sum"
+            core_value = int(runtime_statistics.get(core_key, 0))
+            total_value = int(runtime_statistics.get(total_key, core_value))
+            core_total += core_value
+            core_plus_lm_head_total += total_value
+            breakdown[component] = {
+                "core": core_value,
+                "core_plus_lm_head": total_value,
+            }
+            cold_core_key = f"flops_cold_start_estimated_{component}_{mode}_core_sum"
+            cold_total_key = f"flops_cold_start_estimated_{component}_{mode}_core_plus_lm_head_sum"
+            cold_core_value = int(runtime_statistics.get(cold_core_key, 0))
+            cold_total_value = int(runtime_statistics.get(cold_total_key, cold_core_value))
+            cold_core_total += cold_core_value
+            cold_core_plus_lm_head_total += cold_total_value
+            cold_breakdown[component] = {
+                "core": cold_core_value,
+                "core_plus_lm_head": cold_total_value,
+            }
+        title_mode = mode.capitalize()
+        summary[f"Estimated {title_mode} Core FLOPs"] = core_total
+        summary[f"Estimated {title_mode} Core+LMHead FLOPs"] = core_plus_lm_head_total
+        summary[f"Estimated {title_mode} FLOPs Breakdown"] = breakdown
+        if cold_core_total > 0 or cold_core_plus_lm_head_total > 0:
+            summary[f"Cold Start Estimated {title_mode} Core FLOPs"] = cold_core_total
+            summary[f"Cold Start Estimated {title_mode} Core+LMHead FLOPs"] = cold_core_plus_lm_head_total
+            summary[f"Cold Start Estimated {title_mode} FLOPs Breakdown"] = cold_breakdown
+            summary[f"Total Estimated {title_mode} Core FLOPs Including Cold Start"] = (
+                core_total + cold_core_total
+            )
+            summary[f"Total Estimated {title_mode} Core+LMHead FLOPs Including Cold Start"] = (
+                core_plus_lm_head_total + cold_core_plus_lm_head_total
+            )
+        if generated_tokens > 0:
+            summary[f"Estimated {title_mode} Core FLOPs / Output Token"] = core_total / generated_tokens
+            summary[f"Estimated {title_mode} Core+LMHead FLOPs / Output Token"] = (
+                core_plus_lm_head_total / generated_tokens
+            )
+
+    step_count = int(runtime_statistics.get("flops_trace_step_count", 0))
+    if step_count > 0:
+        summary["FLOPs Trace Avg Draft KV Visible Len"] = (
+            float(runtime_statistics.get("flops_trace_draft_kv_visible_len_sum", 0)) / step_count
+        )
+        summary["FLOPs Trace Avg Draft KV Physical Len"] = (
+            float(runtime_statistics.get("flops_trace_draft_kv_physical_len_sum", 0)) / step_count
+        )
+        summary["FLOPs Trace Avg Verify KV Visible Len"] = (
+            float(runtime_statistics.get("flops_trace_verify_kv_visible_len_sum", 0)) / step_count
+        )
+        summary["FLOPs Trace Avg Verify KV Physical Len"] = (
+            float(runtime_statistics.get("flops_trace_verify_kv_physical_len_sum", 0)) / step_count
+        )
+        summary["FLOPs Trace Avg Draft Attn Skip Count"] = (
+            float(runtime_statistics.get("flops_trace_draft_attn_skip_count_sum", 0)) / step_count
+        )
+        summary["FLOPs Trace Avg Draft MLP Skip Count"] = (
+            float(runtime_statistics.get("flops_trace_draft_mlp_skip_count_sum", 0)) / step_count
+        )
+
+
 def normalize_task_name(task_name):
     name = task_name.strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
@@ -78,12 +180,62 @@ def normalize_task_name(task_name):
         "sam_sum": "samsum",
         "sam_sum_dialogue": "samsum",
         "samsum_dialogue": "samsum",
+        "longgsm8k": "long_gsm8k",
+        "longmmlu": "long_mmlu",
     }
     return aliases.get(name, name)
 
 
 def is_qa_task(task_name):
     return normalize_task_name(task_name) in {"triviaqa", "natural_questions"}
+
+
+LONGGEN_BASE_TASKS = {
+    "long_gsm8k": "gsm8k",
+    "long_mmlu": "mmlu",
+}
+
+LONGGEN_DEFAULT_BATCH_SIZE = {
+    "long_gsm8k": 30,
+    "long_mmlu": 30,
+}
+
+LONGGEN_DEFAULT_NUM_SHOTS = {
+    "long_gsm8k": 8,
+    "long_mmlu": 5,
+}
+
+LONGGEN_SYSTEM_PROMPT = (
+    "Answer each question step by step, adhering to the format shown in the examples provided. "
+    "Start each response with 'Answer_' followed by the question number, and introduce the final "
+    "response in each block with 'The answer is'. Do not repeat the question. Ensure that you "
+    "respond to all the questions presented, regardless of their number."
+)
+
+
+def is_longgen_task(task_name):
+    return normalize_task_name(task_name) in LONGGEN_BASE_TASKS
+
+
+def get_longgen_base_task(task_name):
+    return LONGGEN_BASE_TASKS[normalize_task_name(task_name)]
+
+
+def get_longgen_env_int(task_name, setting_name, default_value):
+    base_task = get_longgen_base_task(task_name).upper()
+    env_names = [
+        f"LONGGEN_{base_task}_{setting_name}",
+        f"LONGGEN_{setting_name}",
+    ]
+    for env_name in env_names:
+        value = os.environ.get(env_name)
+        if value is None or value == "":
+            continue
+        parsed = int(value)
+        if parsed <= 0:
+            raise ValueError(f"{env_name} must be a positive integer.")
+        return parsed
+    return default_value
 
 
 def extract_gsm8k_gold(answer_text):
@@ -236,6 +388,187 @@ def clean_mmlu_output(output_text):
     if first_match:
         cleaned = cleaned[: first_match.start()].strip()
     return cleaned
+
+
+LONGGEN_ANSWER_MARKER_RE = re.compile(
+    r"(?:^|\n)\s*Answer[_\s-]*(\d+)\s*[:：]?\s*",
+    flags=re.IGNORECASE,
+)
+
+
+def format_longgen_gsm8k_answer(answer_text):
+    rationale = str(answer_text)
+    if "####" in rationale:
+        rationale = rationale.split("####")[0]
+    rationale = rationale.strip()
+    gold = extract_gsm8k_gold(answer_text)
+    if gold is not None:
+        if rationale:
+            return f"{rationale}\nThe answer is {gold}."
+        return f"The answer is {gold}."
+    return rationale
+
+
+def format_longgen_mmlu_question(example, question_number):
+    choices = example["choices"]
+    return (
+        f"Question_{question_number}:\n"
+        f"{str(example['question']).strip()}\n"
+        f"(A) {choices[0]}\n"
+        f"(B) {choices[1]}\n"
+        f"(C) {choices[2]}\n"
+        f"(D) {choices[3]}"
+    )
+
+
+def format_longgen_gsm8k_question(example, question_number):
+    return f"Question_{question_number}:\n{str(example['question']).strip()}"
+
+
+def format_longgen_examples(base_task, examples):
+    question_chunks = []
+    answer_chunks = []
+    for idx, example in enumerate(examples, start=1):
+        if base_task == "gsm8k":
+            question_chunks.append(format_longgen_gsm8k_question(example, idx))
+            answer_text = format_longgen_gsm8k_answer(example["answer"])
+        elif base_task == "mmlu":
+            question_chunks.append(format_longgen_mmlu_question(example, idx))
+            answer_text = f"The answer is {extract_mmlu_gold(example)}."
+        else:
+            raise ValueError(f"Unsupported LongGenBench base task: {base_task}")
+        answer_chunks.append(f"Answer_{idx}:\n{answer_text}")
+    return "\n\n".join(question_chunks + answer_chunks).strip()
+
+
+def format_longgen_questions(base_task, examples):
+    question_chunks = []
+    for idx, example in enumerate(examples, start=1):
+        if base_task == "gsm8k":
+            question_chunks.append(format_longgen_gsm8k_question(example, idx))
+        elif base_task == "mmlu":
+            question_chunks.append(format_longgen_mmlu_question(example, idx))
+        else:
+            raise ValueError(f"Unsupported LongGenBench base task: {base_task}")
+    return "\n\n".join(question_chunks).strip()
+
+
+def make_longgen_batches(task_name, examples):
+    batch_size = get_longgen_env_int(
+        task_name,
+        "BATCH_SIZE",
+        LONGGEN_DEFAULT_BATCH_SIZE[normalize_task_name(task_name)],
+    )
+    batches = []
+    for start in range(0, len(examples), batch_size):
+        items = examples[start:start + batch_size]
+        if not items:
+            continue
+        batches.append({
+            "longgen_task": normalize_task_name(task_name),
+            "base_task": get_longgen_base_task(task_name),
+            "batch_index": len(batches),
+            "batch_start": start,
+            "items": items,
+        })
+    return batches
+
+
+def split_longgen_answer_blocks(output_text, expected_count):
+    blocks = [""] * expected_count
+    matches = list(LONGGEN_ANSWER_MARKER_RE.finditer(output_text))
+    if matches:
+        numbered_blocks = []
+        for idx, match in enumerate(matches):
+            start = match.end()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(output_text)
+            numbered_blocks.append((int(match.group(1)), output_text[start:end].strip()))
+
+        numbers = [number for number, _content in numbered_blocks]
+        use_marker_numbers = numbers and min(numbers) <= 2
+        if use_marker_numbers:
+            overflow_blocks = []
+            for number, content in numbered_blocks:
+                if 1 <= number <= expected_count and not blocks[number - 1]:
+                    blocks[number - 1] = content
+                else:
+                    overflow_blocks.append(content)
+            overflow_iter = iter(overflow_blocks)
+            for idx, block in enumerate(blocks):
+                if not block:
+                    blocks[idx] = next(overflow_iter, "")
+        else:
+            for idx, (_number, content) in enumerate(numbered_blocks[:expected_count]):
+                blocks[idx] = content
+        return blocks
+
+    chunks = [chunk.strip() for chunk in re.split(r"\n{2,}", output_text.strip()) if chunk.strip()]
+    for idx, chunk in enumerate(chunks[:expected_count]):
+        blocks[idx] = chunk
+    return blocks
+
+
+def extract_longgen_mmlu_pred(output_text):
+    text = output_text.strip().upper()
+    patterns = [
+        r"THE\s+ANSWER\s+IS\s*\(?\s*([ABCD])\s*\)?(?:\s*[\.\),:]|\b|$)",
+        r"FINAL\s+ANSWER\s*[:：]\s*\(?\s*([ABCD])\s*\)?(?:\s*[\.\),:]|\b|$)",
+        r"ANSWER\s*[:：]\s*\(?\s*([ABCD])\s*\)?(?:\s*[\.\),:]|\b|$)",
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            return matches[-1]
+    return extract_mmlu_pred(output_text)
+
+
+def score_longgen_batch(task_name, batch, output_text):
+    base_task = get_longgen_base_task(task_name)
+    items = batch["items"]
+    blocks = split_longgen_answer_blocks(output_text, len(items))
+    results = []
+    correct_count = 0
+
+    for idx, (item, block) in enumerate(zip(items, blocks), start=1):
+        if base_task == "gsm8k":
+            gold = extract_gsm8k_gold(item["answer"])
+            pred = extract_gsm8k_pred(block)
+            normalized_gold = normalize_gsm8k_answer_number(gold)
+            normalized_pred = normalize_gsm8k_answer_number(pred)
+            correct = (
+                normalized_pred is not None
+                and normalized_gold is not None
+                and normalized_pred == normalized_gold
+            )
+            result = {
+                "question_number": idx,
+                "question": item["question"],
+                "gold_answer": gold,
+                "pred_answer": pred,
+                "answer_text": block,
+                "correct": correct,
+            }
+        elif base_task == "mmlu":
+            gold = extract_mmlu_gold(item)
+            pred = extract_longgen_mmlu_pred(block)
+            correct = pred is not None and gold is not None and pred == gold
+            result = {
+                "question_number": idx,
+                "question": item["question"],
+                "choices_text": item["choices"],
+                "subject": item.get("subject", None),
+                "gold_answer": gold,
+                "pred_answer": pred,
+                "answer_text": block,
+                "correct": correct,
+            }
+        else:
+            raise ValueError(f"Unsupported LongGenBench base task: {base_task}")
+
+        correct_count += int(correct)
+        results.append(result)
+
+    return results, correct_count
 
 
 SAMSUM_STOP_PATTERNS = [
@@ -585,6 +918,43 @@ def clip_input(
         else:
             inputs = tokenizer(raw_prompt, return_tensors="pt").to(device)
 
+    elif is_longgen_task(task_name):
+        base_task = get_longgen_base_task(task_name)
+        examples_text = prompt_shots.strip()
+        questions_text = format_longgen_questions(base_task, prompt["items"])
+        if base_task == "gsm8k":
+            task_instruction = (
+                "Solve the following grade school math problems. "
+                "For each answer block, show concise step-by-step reasoning and end with "
+                "'The answer is <number>'."
+            )
+        elif base_task == "mmlu":
+            task_instruction = (
+                "Answer the following multiple choice questions. "
+                "For each answer block, give concise reasoning and end with "
+                "'The answer is <A, B, C, or D>'."
+            )
+        else:
+            raise ValueError(f"Unsupported LongGenBench base task: {base_task}")
+
+        user_content = task_instruction + "\n\n"
+        if examples_text:
+            user_content += "Examples:\n" + examples_text + "\n\n"
+        user_content += "Following Questions:\n" + questions_text
+
+        if is_instruct and hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
+            messages = [
+                {"role": "system", "content": LONGGEN_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ]
+            formatted = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            inputs = tokenizer(formatted, return_tensors="pt").to(device)
+        else:
+            prompt_text = LONGGEN_SYSTEM_PROMPT + "\n\n" + user_content + "\n\n"
+            inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+
     elif task_name == "gsm8k":
         if is_instruct and hasattr(tokenizer, "apply_chat_template") and tokenizer.chat_template is not None:
             user_content = (
@@ -745,11 +1115,51 @@ def load_data(task_name, seed, data_num=10):
                 break
             data.append(original_data[task_id])
 
+    elif task_name == "long_gsm8k":
+        dataset = load_dataset("openai/gsm8k", "main", split="test")
+        if data_num is not None and data_num < len(dataset):
+            dataset = dataset.select(range(data_num))
+        examples = [dict(dataset[i]) for i in range(len(dataset))]
+        num_shots = get_longgen_env_int(
+            task_name,
+            "NUM_SHOTS",
+            LONGGEN_DEFAULT_NUM_SHOTS[task_name],
+        )
+        if num_shots > 0:
+            shot_dataset = load_dataset("openai/gsm8k", "main", split="train").select(range(num_shots))
+            prompt_shots = format_longgen_examples(
+                "gsm8k",
+                [dict(shot_dataset[i]) for i in range(len(shot_dataset))],
+            )
+        data = make_longgen_batches(task_name, examples)
+
     elif task_name == "gsm8k":
         dataset = load_dataset("openai/gsm8k", "main", split="test")
         if data_num is not None and data_num < len(dataset):
             dataset = dataset.select(range(data_num))
         data = dataset
+
+    elif task_name == "long_mmlu":
+        dataset = load_dataset("cais/mmlu", "all", split="test").shuffle(seed=seed)
+        if data_num is not None and data_num < len(dataset):
+            dataset = dataset.select(range(data_num))
+        examples = [dict(dataset[i]) for i in range(len(dataset))]
+        num_shots = get_longgen_env_int(
+            task_name,
+            "NUM_SHOTS",
+            LONGGEN_DEFAULT_NUM_SHOTS[task_name],
+        )
+        if num_shots > 0:
+            try:
+                shot_dataset = load_dataset("cais/mmlu", "all", split="dev").shuffle(seed=seed)
+            except ValueError:
+                shot_dataset = load_dataset("cais/mmlu", "all", split="validation").shuffle(seed=seed)
+            shot_dataset = shot_dataset.select(range(min(num_shots, len(shot_dataset))))
+            prompt_shots = format_longgen_examples(
+                "mmlu",
+                [dict(shot_dataset[i]) for i in range(len(shot_dataset))],
+            )
+        data = make_longgen_batches(task_name, examples)
 
     elif task_name == "mmlu":
         dataset = load_dataset("cais/mmlu", "all", split="test").shuffle(seed=seed)
@@ -890,6 +1300,8 @@ def get_model_answers(
         choices = []
 
         # MT-Bench needs one FastChat-compatible answer row per question.
+        # There is no label-based accuracy here; quality is judged later with
+        # the FastChat MT-Bench judge pipeline using the generated turns.
         if task_name == "mt_bench":
             turns_outputs = []
             turns = [turn.strip() for turn in question.get("turns", []) if str(turn).strip()]
@@ -916,6 +1328,12 @@ def get_model_answers(
                     model_id=model_id,
                 )
 
+                set_flops_trace_context(
+                    forward_kwargs.get("statistics"),
+                    question_idx,
+                    question_id=question.get("question_id", question_idx),
+                    turn_idx=turn_idx,
+                )
                 safe_cuda_synchronize()
                 start_time = time.time()
                 output_ids, new_token_num, step, accept_length_tree, draft_token_num = forward_func(
@@ -1011,6 +1429,12 @@ def get_model_answers(
                 model_id=model_id,
             )
 
+            set_flops_trace_context(
+                forward_kwargs.get("statistics"),
+                question_idx,
+                question_id=question.get("question_id", question_idx) if isinstance(question, dict) else question_idx,
+                turn_idx=None,
+            )
             cur_accept_lengths_tree = []
             cur_draft_num = 0
             steps = []
@@ -1094,6 +1518,20 @@ def get_model_answers(
         if task_name == "humaneval":
             if isinstance(question, dict) and "task_id" in question:
                 sample_record["task_id"] = question["task_id"]
+
+        elif is_longgen_task(task_name):
+            longgen_results, correct_count = score_longgen_batch(task_name, question, output)
+            question_count = len(longgen_results)
+            total_correct += correct_count
+            total_scored += question_count
+
+            sample_record["longgen_task"] = question.get("base_task", get_longgen_base_task(task_name))
+            sample_record["batch_index"] = question.get("batch_index", question_idx)
+            sample_record["batch_start"] = question.get("batch_start", None)
+            sample_record["question_count"] = question_count
+            sample_record["correct_count"] = correct_count
+            sample_record["accuracy"] = correct_count / question_count if question_count > 0 else 0.0
+            sample_record["longgen_results"] = longgen_results
 
         elif task_name == "gsm8k":
             gold = extract_gsm8k_gold(question["answer"])
@@ -1203,6 +1641,7 @@ def get_model_answers(
         summary["Best MLP Layer Set"] = [int(x) for x in list(best_mlp_skip_layer_id_set)]
 
     runtime_statistics = forward_kwargs.get("statistics")
+    add_flops_trace_summary(summary, runtime_statistics)
     if runtime_statistics and runtime_statistics.get("draft_kv_score_source"):
         summary["Draft KV Cache Mode"] = runtime_statistics.get("draft_kv_cache_mode", "copy")
         summary["Draft KV Score Source"] = runtime_statistics.get("draft_kv_score_source")
@@ -1213,6 +1652,74 @@ def get_model_answers(
         summary["Draft KV Reuse Score Misses"] = int(runtime_statistics.get("draft_kv_reuse_score_misses", 0))
         summary["Draft KV Reuse Score Updates"] = int(runtime_statistics.get("draft_kv_reuse_score_updates", 0))
         summary["Draft KV Reuse Empty Updates"] = int(runtime_statistics.get("draft_kv_reuse_score_empty_updates", 0))
+        summary["Verify KV Compress"] = bool(runtime_statistics.get("verify_kv_compress", False))
+        if runtime_statistics.get("verify_kv_compress", False):
+            summary["Verify KV Cache Mode"] = runtime_statistics.get("verify_kv_cache_mode", "copy")
+            summary["Verify KV Score Source"] = runtime_statistics.get("verify_kv_score_source", "reuse")
+            summary["Verify KV Retain Ratio"] = runtime_statistics.get("verify_kv_retain_ratio")
+            summary["Verify KV Bootstrap Full Steps"] = int(runtime_statistics.get("verify_kv_bootstrap_full_steps", 0))
+            summary["Verify KV Bootstrap Full Uses"] = int(runtime_statistics.get("verify_kv_bootstrap_full_uses", 0))
+            summary["Verify KV Copy Cache Rebuilds"] = int(runtime_statistics.get("verify_kv_copy_cache_rebuilds", 0))
+            summary["Verify KV Mask Cache Rebuilds"] = int(runtime_statistics.get("verify_kv_mask_cache_rebuilds", 0))
+            summary["Verify KV Reuse Score Hits"] = int(runtime_statistics.get("verify_kv_reuse_score_hits", 0))
+            summary["Verify KV Reuse Score Misses"] = int(runtime_statistics.get("verify_kv_reuse_score_misses", 0))
+            summary["Verify KV Semantic Score Hits"] = int(runtime_statistics.get("verify_kv_semantic_score_hits", 0))
+            summary["Verify KV Semantic Score Misses"] = int(runtime_statistics.get("verify_kv_semantic_score_misses", 0))
+            summary["Verify KV Semantic Score Updates"] = int(runtime_statistics.get("verify_kv_semantic_score_updates", 0))
+            summary["Verify KV Scope Recent Size"] = int(runtime_statistics.get("verify_kv_scope_recent_size", 0))
+            summary["Verify KV Scope Beta1"] = int(runtime_statistics.get("verify_kv_scope_beta1", 0))
+            summary["Verify KV Scope Beta2"] = int(runtime_statistics.get("verify_kv_scope_beta2", 0))
+            summary["Verify KV Scope Score Full Only"] = bool(runtime_statistics.get("verify_kv_scope_score_full_only", True))
+            summary["Verify KV Scope Full Decode Uses"] = int(runtime_statistics.get("verify_kv_scope_full_decode_uses", 0))
+            summary["Verify KV Safe Commit"] = bool(runtime_statistics.get("verify_kv_safe_commit", False))
+            summary["Verify KV Safe Commit Uses"] = int(runtime_statistics.get("verify_kv_safe_commit_uses", 0))
+            summary["Verify KV Dynamic"] = bool(runtime_statistics.get("verify_kv_dynamic", False))
+            if runtime_statistics.get("verify_kv_dynamic", False):
+                summary["Verify KV Dynamic Initial Beta1"] = int(runtime_statistics.get("verify_kv_dynamic_initial_beta1", 0))
+                summary["Verify KV Dynamic Current Beta1"] = int(runtime_statistics.get("verify_kv_dynamic_current_beta1", runtime_statistics.get("verify_kv_scope_beta1", 0)))
+                summary["Verify KV Dynamic Min Beta1"] = int(runtime_statistics.get("verify_kv_dynamic_min_beta1", 0))
+                summary["Verify KV Dynamic Max Beta1"] = int(runtime_statistics.get("verify_kv_dynamic_max_beta1", 0))
+                summary["Verify KV Dynamic Step"] = int(runtime_statistics.get("verify_kv_dynamic_step", 0))
+                summary["Verify KV Dynamic Window"] = int(runtime_statistics.get("verify_kv_dynamic_window", 0))
+                summary["Verify KV Dynamic Acceptance Floor"] = float(runtime_statistics.get("verify_kv_dynamic_acceptance_floor", 0.88))
+                summary["Verify KV Dynamic Mean Floor"] = float(runtime_statistics.get("verify_kv_dynamic_mean_floor", 3.0))
+                summary["Verify KV Dynamic Confidence Floor"] = float(runtime_statistics.get("verify_kv_dynamic_confidence_floor", 0.5))
+                summary["Verify KV Dynamic Confidence Low"] = float(runtime_statistics.get("verify_kv_dynamic_confidence_low", 0.25))
+                summary["Verify KV Dynamic Decisions"] = int(runtime_statistics.get("verify_kv_dynamic_decision_count", 0))
+                summary["Verify KV Dynamic Switches"] = int(runtime_statistics.get("verify_kv_dynamic_switches", 0))
+                summary["Verify KV Dynamic More-Compress Switches"] = int(runtime_statistics.get("verify_kv_dynamic_more_compress_switches", 0))
+                summary["Verify KV Dynamic Less-Compress Switches"] = int(runtime_statistics.get("verify_kv_dynamic_less_compress_switches", 0))
+                summary["Verify KV Dynamic Action Counts"] = runtime_statistics.get("verify_kv_dynamic_action_counts", {})
+                dyn_obs = int(runtime_statistics.get("verify_kv_dynamic_observations", 0))
+                summary["Verify KV Dynamic Observations"] = dyn_obs
+                if dyn_obs > 0:
+                    summary["Verify KV Dynamic Avg Acceptance"] = (
+                        float(runtime_statistics.get("verify_kv_dynamic_acceptance_sum", 0.0)) / dyn_obs
+                    )
+                    summary["Verify KV Dynamic Avg Accepted Tokens"] = (
+                        float(runtime_statistics.get("verify_kv_dynamic_mean_sum", 0.0)) / dyn_obs
+                    )
+                    summary["Verify KV Dynamic Avg Confidence Margin"] = (
+                        float(runtime_statistics.get("verify_kv_dynamic_confidence_margin_sum", 0.0)) / dyn_obs
+                    )
+                    summary["Verify KV Dynamic Avg Min Confidence Margin"] = (
+                        float(runtime_statistics.get("verify_kv_dynamic_confidence_min_sum", 0.0)) / dyn_obs
+                    )
+                summary["Verify KV Dynamic Last Window Acceptance"] = runtime_statistics.get("verify_kv_dynamic_last_window_acceptance")
+                summary["Verify KV Dynamic Last Window Mean"] = runtime_statistics.get("verify_kv_dynamic_last_window_mean")
+                summary["Verify KV Dynamic Last Window Margin"] = runtime_statistics.get("verify_kv_dynamic_last_window_margin")
+            scope_count = int(runtime_statistics.get("verify_kv_scope_selection_count", 0))
+            summary["Verify KV Scope Selection Count"] = scope_count
+            if scope_count > 0:
+                summary["Verify KV Scope Avg Prefill Kept"] = (
+                    float(runtime_statistics.get("verify_kv_scope_prefill_kept_sum", 0)) / scope_count
+                )
+                summary["Verify KV Scope Avg Decode Len"] = (
+                    float(runtime_statistics.get("verify_kv_scope_decode_len_sum", 0)) / scope_count
+                )
+                summary["Verify KV Scope Avg Decode Kept"] = (
+                    float(runtime_statistics.get("verify_kv_scope_decode_kept_sum", 0)) / scope_count
+                )
     if runtime_statistics and runtime_statistics.get("cosine_prefill_skip_layers"):
         summary["Cosine Prefill Skip Layers"] = True
         summary["Cosine Skip Mode"] = runtime_statistics.get("cosine_skip_mode", "topk")
@@ -1441,6 +1948,12 @@ def get_model_answers(
         print("Adaptive Step Config Count:", summary["Adaptive Step Config Count"])
     if "Adaptive Cold Start Time Sec" in summary:
         print("Adaptive Cold Start Time Sec:", summary["Adaptive Cold Start Time Sec"])
+    if "FLOPs Trace File" in summary:
+        print("FLOPs Trace File:", summary["FLOPs Trace File"])
+    if "Estimated Physical Core FLOPs / Output Token" in summary:
+        print("Estimated Physical Core FLOPs / Output Token:", summary["Estimated Physical Core FLOPs / Output Token"])
+    if "Estimated Logical Core FLOPs / Output Token" in summary:
+        print("Estimated Logical Core FLOPs / Output Token:", summary["Estimated Logical Core FLOPs / Output Token"])
     if "Accuracy" in summary:
         print("Accuracy:", summary["Accuracy"])
     if "Exact Match" in summary:

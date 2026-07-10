@@ -22,26 +22,85 @@ SKIP_RATIO=${SKIP_RATIO:-0.45}
 DRAFT_TOKEN_NUM=${DRAFT_TOKEN_NUM-}
 RUN_BASELINE=${RUN_BASELINE-}
 DEFAULT_FINAL_ADAPTIVE=0
+DEFAULT_FINAL2_ADAPTIVE=0
 DEFAULT_RUN_BASELINE=1
+DEFAULT_VERIFY_KV_DYNAMIC_MIN_BETA1=64
+DEFAULT_VERIFY_KV_DYNAMIC_PATIENCE=2
+DEFAULT_VERIFY_KV_DYNAMIC_COOLDOWN=16
+DEFAULT_VERIFY_KV_DYNAMIC_ACCEPTANCE_FLOOR=0.88
+DEFAULT_VERIFY_KV_DYNAMIC_MEAN_FLOOR=3.0
+DEFAULT_VERIFY_KV_DYNAMIC_CONFIDENCE_FLOOR=0.5
+DEFAULT_VERIFY_KV_CACHE_MODE=mask
+DEFAULT_VERIFY_KV_SCORE_SOURCE=semantic
+DEFAULT_VERIFY_KV_RETAIN_RATIO=""
+DEFAULT_VERIFY_KV_BOOTSTRAP_FULL_STEPS=0
+DEFAULT_VERIFY_KV_SCOPE_BETA1=128
+DEFAULT_VERIFY_KV_SCOPE_BETA2=256
 
+# Task blocks tune only defaults.  Any environment variable supplied by the
+# caller still wins later through the ${VAR:-DEFAULT} assignments.
 case "${TASK_NAME}" in
   mmlu)
     DEFAULT_RETAIN_RATIO=0.6
     DEFAULT_MAX_NEW_TOKENS=256
     DEFAULT_ADAPTIVE_WINDOW=8
     DEFAULT_ADAPTIVE_MIN_OBSERVATIONS=12
+    # MMLU is short-form and label-scored, so the verifier default uses the
+    # lightweight reused-attention mask path that was stable in ablations.
+    DEFAULT_VERIFY_KV_CACHE_MODE=mask
+    DEFAULT_VERIFY_KV_SCORE_SOURCE=reuse
+    DEFAULT_VERIFY_KV_RETAIN_RATIO=0.8
+    ;;
+  long_mmlu)
+    DEFAULT_RETAIN_RATIO=0.6
+    DEFAULT_MAX_NEW_TOKENS=4096
+    DEFAULT_ADAPTIVE_WINDOW=16
+    DEFAULT_ADAPTIVE_MIN_OBSERVATIONS=24
+    DEFAULT_VERIFY_KV_CACHE_MODE=mask
+    DEFAULT_VERIFY_KV_SCORE_SOURCE=reuse
+    DEFAULT_VERIFY_KV_RETAIN_RATIO=0.8
     ;;
   gsm8k)
     DEFAULT_RETAIN_RATIO=0.7
     DEFAULT_MAX_NEW_TOKENS=384
     DEFAULT_ADAPTIVE_WINDOW=16
     DEFAULT_ADAPTIVE_MIN_OBSERVATIONS=24
+    # GSM8K is CoT-sensitive.  Use SCOPE-style verifier compression by
+    # default so prompt KV is preserved and only generated decoding KV is
+    # compressed with beta1/beta2 budgets.
+    DEFAULT_VERIFY_KV_SCORE_SOURCE=scope
+    DEFAULT_VERIFY_KV_SCOPE_BETA1=64
+    DEFAULT_VERIFY_KV_SCOPE_BETA2=128
+    DEFAULT_VERIFY_KV_DYNAMIC_MIN_BETA1=64
+    DEFAULT_VERIFY_KV_DYNAMIC_PATIENCE=4
+    DEFAULT_VERIFY_KV_DYNAMIC_COOLDOWN=32
+    DEFAULT_VERIFY_KV_DYNAMIC_ACCEPTANCE_FLOOR=0.90
+    DEFAULT_VERIFY_KV_DYNAMIC_MEAN_FLOOR=3.7
+    DEFAULT_VERIFY_KV_DYNAMIC_CONFIDENCE_FLOOR=8.0
+    ;;
+  long_gsm8k)
+    DEFAULT_RETAIN_RATIO=0.7
+    DEFAULT_MAX_NEW_TOKENS=4096
+    DEFAULT_ADAPTIVE_WINDOW=16
+    DEFAULT_ADAPTIVE_MIN_OBSERVATIONS=24
+    DEFAULT_VERIFY_KV_DYNAMIC_MIN_BETA1=64
+    DEFAULT_VERIFY_KV_DYNAMIC_PATIENCE=4
+    DEFAULT_VERIFY_KV_DYNAMIC_COOLDOWN=32
+    DEFAULT_VERIFY_KV_DYNAMIC_ACCEPTANCE_FLOOR=0.90
+    DEFAULT_VERIFY_KV_DYNAMIC_MEAN_FLOOR=3.7
+    DEFAULT_VERIFY_KV_DYNAMIC_CONFIDENCE_FLOOR=8.0
     ;;
   samsum)
     DEFAULT_RETAIN_RATIO=0.6
     DEFAULT_MAX_NEW_TOKENS=96
     DEFAULT_ADAPTIVE_WINDOW=8
     DEFAULT_ADAPTIVE_MIN_OBSERVATIONS=12
+    # SAMSum uses the global verifier defaults (mask + semantic), with a
+    # one-step exact verifier bootstrap so semantic scores exist before masking.
+    DEFAULT_FINAL2_ADAPTIVE=1
+    DEFAULT_RUN_BASELINE=0
+    DEFAULT_VERIFY_KV_RETAIN_RATIO=0.9
+    DEFAULT_VERIFY_KV_BOOTSTRAP_FULL_STEPS=1
     if [ "${DATA_NUM}" -gt 819 ]; then
       DATA_NUM=819
     fi
@@ -58,7 +117,7 @@ case "${TASK_NAME}" in
     fi
     ;;
   *)
-    echo "This cosine-prefill script currently supports TASK_NAME=mmlu, TASK_NAME=gsm8k, TASK_NAME=samsum, or TASK_NAME=mt_bench." >&2
+    echo "This cosine-prefill script currently supports TASK_NAME=mmlu, TASK_NAME=long_mmlu, TASK_NAME=gsm8k, TASK_NAME=long_gsm8k, TASK_NAME=samsum, or TASK_NAME=mt_bench." >&2
     exit 1
     ;;
 esac
@@ -68,7 +127,7 @@ RETAIN_RATIO=${RETAIN_RATIO:-${DEFAULT_RETAIN_RATIO}}
 RUN_BASELINE=${RUN_BASELINE:-${DEFAULT_RUN_BASELINE}}
 AGGRESSIVE_ADAPTIVE=${AGGRESSIVE_ADAPTIVE:-1}
 FINAL_ADAPTIVE=${FINAL_ADAPTIVE:-${DEFAULT_FINAL_ADAPTIVE}}
-FINAL2_ADAPTIVE=${FINAL2_ADAPTIVE:-0}
+FINAL2_ADAPTIVE=${FINAL2_ADAPTIVE:-${DEFAULT_FINAL2_ADAPTIVE}}
 ADAPTIVE_MIN_RETAIN_RATIO=${ADAPTIVE_MIN_RETAIN_RATIO:-0.1}
 ADAPTIVE_RATIO_STEP=${ADAPTIVE_RATIO_STEP:-0.1}
 ADAPTIVE_AGGRESSIVE_TOLERANCE=${ADAPTIVE_AGGRESSIVE_TOLERANCE:-0.02}
@@ -125,7 +184,7 @@ FINAL2_LAYER_SKIP_GAIN_WEIGHT=${FINAL2_LAYER_SKIP_GAIN_WEIGHT:-2.0}
 # Dynamic-6 cold start is a one-time warmup before the benchmark stream.  The
 # default dynamic mode uses a task-agnostic repeat-passage prompt while final2
 # adapts, then merges weak table priors back into the real run.
-ADAPTIVE_COLD_START=${ADAPTIVE_COLD_START:-0}
+ADAPTIVE_COLD_START=${ADAPTIVE_COLD_START:-1}
 ADAPTIVE_COLD_START_MODE=${ADAPTIVE_COLD_START_MODE:-dynamic}
 ADAPTIVE_COLD_START_PROMPT=${ADAPTIVE_COLD_START_PROMPT:-auto}
 ADAPTIVE_COLD_START_MAX_NEW_TOKENS=${ADAPTIVE_COLD_START_MAX_NEW_TOKENS:-192}
@@ -256,7 +315,37 @@ COSINE_MLP_INTERVAL=${COSINE_MLP_INTERVAL:-0}
 DRAFT_KV_SCORE_SOURCE=${DRAFT_KV_SCORE_SOURCE:-reuse}
 DRAFT_KV_CACHE_MODE=${DRAFT_KV_CACHE_MODE:-mask}
 DRAFT_KV_REUSE_EMA=${DRAFT_KV_REUSE_EMA:-0.7}
+VERIFY_KV_COMPRESS=${VERIFY_KV_COMPRESS:-1}
+# Verifier KV defaults are task-aware above, but every value remains
+# overridable from the command line environment for ablation runs.
+VERIFY_KV_CACHE_MODE=${VERIFY_KV_CACHE_MODE:-${DEFAULT_VERIFY_KV_CACHE_MODE}}
+VERIFY_KV_SCORE_SOURCE=${VERIFY_KV_SCORE_SOURCE:-${DEFAULT_VERIFY_KV_SCORE_SOURCE}}
+VERIFY_KV_RETAIN_RATIO=${VERIFY_KV_RETAIN_RATIO:-${DEFAULT_VERIFY_KV_RETAIN_RATIO}}
+VERIFY_KV_BOOTSTRAP_FULL_STEPS=${VERIFY_KV_BOOTSTRAP_FULL_STEPS:-${DEFAULT_VERIFY_KV_BOOTSTRAP_FULL_STEPS}}
+VERIFY_KV_SCOPE_BETA1=${VERIFY_KV_SCOPE_BETA1:-${DEFAULT_VERIFY_KV_SCOPE_BETA1}}
+VERIFY_KV_SCOPE_BETA2=${VERIFY_KV_SCOPE_BETA2:-${DEFAULT_VERIFY_KV_SCOPE_BETA2}}
+VERIFY_KV_SCOPE_RECENT_SIZE=${VERIFY_KV_SCOPE_RECENT_SIZE-}
+if [ -n "${VERIFY_KV_SCOPE_RECENT_SIZE}" ]; then
+  VERIFY_KV_SCOPE_BETA2="${VERIFY_KV_SCOPE_RECENT_SIZE}"
+fi
+VERIFY_KV_SAFE_COMMIT=${VERIFY_KV_SAFE_COMMIT:-0}
+VERIFY_KV_DYNAMIC=${VERIFY_KV_DYNAMIC:-0}
+VERIFY_KV_DYNAMIC_MIN_BETA1=${VERIFY_KV_DYNAMIC_MIN_BETA1:-${DEFAULT_VERIFY_KV_DYNAMIC_MIN_BETA1}}
+# Empty means inference_swift.py will cap dynamic beta1 at the initial
+# VERIFY_KV_SCOPE_BETA1.  Set this explicitly when beta1 should recover above
+# its starting value.
+VERIFY_KV_DYNAMIC_MAX_BETA1=${VERIFY_KV_DYNAMIC_MAX_BETA1-}
+VERIFY_KV_DYNAMIC_STEP=${VERIFY_KV_DYNAMIC_STEP:-32}
+VERIFY_KV_DYNAMIC_WINDOW=${VERIFY_KV_DYNAMIC_WINDOW:-32}
+VERIFY_KV_DYNAMIC_MIN_OBSERVATIONS=${VERIFY_KV_DYNAMIC_MIN_OBSERVATIONS:-32}
+VERIFY_KV_DYNAMIC_ACCEPTANCE_FLOOR=${VERIFY_KV_DYNAMIC_ACCEPTANCE_FLOOR:-${DEFAULT_VERIFY_KV_DYNAMIC_ACCEPTANCE_FLOOR}}
+VERIFY_KV_DYNAMIC_MEAN_FLOOR=${VERIFY_KV_DYNAMIC_MEAN_FLOOR:-${DEFAULT_VERIFY_KV_DYNAMIC_MEAN_FLOOR}}
+VERIFY_KV_DYNAMIC_CONFIDENCE_FLOOR=${VERIFY_KV_DYNAMIC_CONFIDENCE_FLOOR:-${DEFAULT_VERIFY_KV_DYNAMIC_CONFIDENCE_FLOOR}}
+VERIFY_KV_DYNAMIC_CONFIDENCE_LOW=${VERIFY_KV_DYNAMIC_CONFIDENCE_LOW:-0.25}
+VERIFY_KV_DYNAMIC_PATIENCE=${VERIFY_KV_DYNAMIC_PATIENCE:-${DEFAULT_VERIFY_KV_DYNAMIC_PATIENCE}}
+VERIFY_KV_DYNAMIC_COOLDOWN=${VERIFY_KV_DYNAMIC_COOLDOWN:-${DEFAULT_VERIFY_KV_DYNAMIC_COOLDOWN}}
 WRITE_LOG=${WRITE_LOG:-1}
+FLOPS_TRACE=${FLOPS_TRACE:-1}
 
 case "${DRAFT_KV_CACHE_MODE}" in
   copy|mask)
@@ -267,6 +356,145 @@ case "${DRAFT_KV_CACHE_MODE}" in
     ;;
 esac
 
+case "${VERIFY_KV_COMPRESS,,}" in
+  1|true|yes|on)
+    VERIFY_KV_STATUS="enabled"
+    ;;
+  0|false|no|off)
+    VERIFY_KV_STATUS="disabled"
+    ;;
+  *)
+    echo "VERIFY_KV_COMPRESS must be one of 1/0, true/false, yes/no, on/off." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_CACHE_MODE}" in
+  copy|mask)
+    ;;
+  *)
+    echo "VERIFY_KV_CACHE_MODE must be one of copy or mask." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_SCORE_SOURCE}" in
+  heuristic|observation|reuse|semantic|scope)
+    ;;
+  *)
+    echo "VERIFY_KV_SCORE_SOURCE must be one of heuristic, observation, reuse, semantic, or scope." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_BOOTSTRAP_FULL_STEPS}" in
+  ''|*[!0-9]*)
+    echo "VERIFY_KV_BOOTSTRAP_FULL_STEPS must be a non-negative integer." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_SCOPE_RECENT_SIZE}" in
+  *[!0-9]*)
+    echo "VERIFY_KV_SCOPE_RECENT_SIZE must be a non-negative integer." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_SCOPE_BETA1}" in
+  ''|*[!0-9]*)
+    echo "VERIFY_KV_SCOPE_BETA1 must be a non-negative integer." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_SCOPE_BETA2}" in
+  ''|*[!0-9]*)
+    echo "VERIFY_KV_SCOPE_BETA2 must be a non-negative integer." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_SAFE_COMMIT,,}" in
+  1|true|yes|on)
+    VERIFY_KV_SAFE_COMMIT_STATUS="enabled"
+    ;;
+  0|false|no|off)
+    VERIFY_KV_SAFE_COMMIT_STATUS="disabled"
+    ;;
+  *)
+    echo "VERIFY_KV_SAFE_COMMIT must be one of 1/0, true/false, yes/no, on/off." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_DYNAMIC,,}" in
+  1|true|yes|on)
+    VERIFY_KV_DYNAMIC_STATUS="enabled"
+    ;;
+  0|false|no|off)
+    VERIFY_KV_DYNAMIC_STATUS="disabled"
+    ;;
+  *)
+    echo "VERIFY_KV_DYNAMIC must be one of 1/0, true/false, yes/no, on/off." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_DYNAMIC_MIN_BETA1}" in
+  ''|*[!0-9]*)
+    echo "VERIFY_KV_DYNAMIC_MIN_BETA1 must be a non-negative integer." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_DYNAMIC_MAX_BETA1}" in
+  *[!0-9]*)
+    echo "VERIFY_KV_DYNAMIC_MAX_BETA1 must be a non-negative integer when set." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_DYNAMIC_STEP}" in
+  ''|*[!0-9]*)
+    echo "VERIFY_KV_DYNAMIC_STEP must be a positive integer." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_DYNAMIC_WINDOW}" in
+  ''|*[!0-9]*)
+    echo "VERIFY_KV_DYNAMIC_WINDOW must be a positive integer." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_DYNAMIC_MIN_OBSERVATIONS}" in
+  ''|*[!0-9]*)
+    echo "VERIFY_KV_DYNAMIC_MIN_OBSERVATIONS must be a positive integer." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_DYNAMIC_PATIENCE}" in
+  ''|*[!0-9]*)
+    echo "VERIFY_KV_DYNAMIC_PATIENCE must be a positive integer." >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFY_KV_DYNAMIC_COOLDOWN}" in
+  ''|*[!0-9]*)
+    echo "VERIFY_KV_DYNAMIC_COOLDOWN must be a non-negative integer." >&2
+    exit 1
+    ;;
+esac
+
+if [ "${VERIFY_KV_DYNAMIC_STATUS}" = "enabled" ] && [ "${VERIFY_KV_SCORE_SOURCE}" != "scope" ]; then
+  echo "VERIFY_KV_DYNAMIC=1 requires VERIFY_KV_SCORE_SOURCE=scope." >&2
+  exit 1
+fi
+
 case "${WRITE_LOG,,}" in
   1|true|yes|on)
     WRITE_LOG_STATUS="enabled"
@@ -276,6 +504,19 @@ case "${WRITE_LOG,,}" in
     ;;
   *)
     echo "WRITE_LOG must be one of 1/0, true/false, yes/no, on/off." >&2
+    exit 1
+    ;;
+esac
+
+case "${FLOPS_TRACE,,}" in
+  1|true|yes|on)
+    FLOPS_TRACE_STATUS="enabled"
+    ;;
+  0|false|no|off)
+    FLOPS_TRACE_STATUS="disabled"
+    ;;
+  *)
+    echo "FLOPS_TRACE must be one of 1/0, true/false, yes/no, on/off." >&2
     exit 1
     ;;
 esac
@@ -360,6 +601,47 @@ case "${ADAPTIVE_COLD_START_STATUS}" in
     ;;
 esac
 
+VERIFY_KV_ARGS=()
+case "${VERIFY_KV_STATUS}" in
+  enabled)
+    VERIFY_KV_ARGS=(
+      --verify-kv-compress
+      --verify-kv-cache-mode "${VERIFY_KV_CACHE_MODE}"
+      --verify-kv-score-source "${VERIFY_KV_SCORE_SOURCE}"
+      --verify-kv-bootstrap-full-steps "${VERIFY_KV_BOOTSTRAP_FULL_STEPS}"
+      --verify-kv-scope-beta1 "${VERIFY_KV_SCOPE_BETA1}"
+      --verify-kv-scope-beta2 "${VERIFY_KV_SCOPE_BETA2}"
+    )
+    # SCOPE ignores retain ratio by design: its decode budget is beta1+beta2.
+    if [ -n "${VERIFY_KV_RETAIN_RATIO}" ] && [ "${VERIFY_KV_SCORE_SOURCE}" != "scope" ]; then
+      VERIFY_KV_ARGS+=(--verify-kv-retain-ratio "${VERIFY_KV_RETAIN_RATIO}")
+    fi
+    if [ "${VERIFY_KV_SAFE_COMMIT_STATUS}" = "enabled" ]; then
+      VERIFY_KV_ARGS+=(--verify-kv-safe-commit)
+    fi
+    if [ "${VERIFY_KV_DYNAMIC_STATUS}" = "enabled" ]; then
+      VERIFY_KV_ARGS+=(
+        --verify-kv-dynamic
+        --verify-kv-dynamic-min-beta1 "${VERIFY_KV_DYNAMIC_MIN_BETA1}"
+        --verify-kv-dynamic-step "${VERIFY_KV_DYNAMIC_STEP}"
+        --verify-kv-dynamic-window "${VERIFY_KV_DYNAMIC_WINDOW}"
+        --verify-kv-dynamic-min-observations "${VERIFY_KV_DYNAMIC_MIN_OBSERVATIONS}"
+        --verify-kv-dynamic-acceptance-floor "${VERIFY_KV_DYNAMIC_ACCEPTANCE_FLOOR}"
+        --verify-kv-dynamic-mean-floor "${VERIFY_KV_DYNAMIC_MEAN_FLOOR}"
+        --verify-kv-dynamic-confidence-floor "${VERIFY_KV_DYNAMIC_CONFIDENCE_FLOOR}"
+        --verify-kv-dynamic-confidence-low "${VERIFY_KV_DYNAMIC_CONFIDENCE_LOW}"
+        --verify-kv-dynamic-patience "${VERIFY_KV_DYNAMIC_PATIENCE}"
+        --verify-kv-dynamic-cooldown "${VERIFY_KV_DYNAMIC_COOLDOWN}"
+      )
+      if [ -n "${VERIFY_KV_DYNAMIC_MAX_BETA1}" ]; then
+        VERIFY_KV_ARGS+=(--verify-kv-dynamic-max-beta1 "${VERIFY_KV_DYNAMIC_MAX_BETA1}")
+      fi
+    fi
+    ;;
+  disabled)
+    ;;
+esac
+
 case "${ADAPTIVE_LAYER_CONTROLLER,,}" in
   1|true|yes|on)
     ADAPTIVE_LAYER_ARG="--adaptive-layer-controller --adaptive-layer-fallback-window ${ADAPTIVE_LAYER_FALLBACK_WINDOW} --adaptive-layer-improvement-delta ${ADAPTIVE_LAYER_IMPROVEMENT_DELTA}"
@@ -421,7 +703,10 @@ if [ -n "${COSINE_MAX_SKIP_LAYERS}" ]; then
   COSINE_MAX_SKIP_SUFFIX="-cosine_max_skip_layers-${COSINE_MAX_SKIP_LAYERS}"
 fi
 
-if [ "${ADAPTIVE_COLD_START_STATUS}" = "enabled" ]; then
+if [ "${ADAPTIVE_COLD_START_STATUS}" = "enabled" ] && [ "${VERIFY_KV_STATUS}" = "enabled" ]; then
+  # dynamic-6-2 marks the dynamic-6 draft path plus verifier KV compression.
+  RETAIN_RATIO_RUN_NAME="dynamic-6-2"
+elif [ "${ADAPTIVE_COLD_START_STATUS}" = "enabled" ]; then
   RETAIN_RATIO_RUN_NAME="dynamic-6"
 elif [ "${LYAPUNOV_ADAPTIVE_STATUS}" = "enabled" ]; then
   RETAIN_RATIO_RUN_NAME="dynamic-5${ADAPTIVE_MODE_SUFFIX}"
@@ -429,13 +714,54 @@ else
   RETAIN_RATIO_RUN_NAME="dynamic-4${ADAPTIVE_MODE_SUFFIX}"
 fi
 DRAFT_KV_SCORE_SUFFIX="-kvsrc-${DRAFT_KV_SCORE_SOURCE}"
-DRAFT_KV_CACHE_SUFFIX=""
-if [ "${DRAFT_KV_CACHE_MODE}" = "mask" ]; then
-  DRAFT_KV_CACHE_SUFFIX="-kvmask"
+VERIFY_KV_SUFFIX=""
+if [ "${VERIFY_KV_STATUS}" = "enabled" ]; then
+  case "${VERIFY_KV_SCORE_SOURCE}" in
+    semantic)
+      VERIFY_KV_SCORE_TAG="sem"
+      ;;
+    scope)
+      VERIFY_KV_SCORE_TAG="s"
+      ;;
+    observation)
+      VERIFY_KV_SCORE_TAG="obs"
+      ;;
+    heuristic)
+      VERIFY_KV_SCORE_TAG="heu"
+      ;;
+    reuse)
+      VERIFY_KV_SCORE_TAG="reuse"
+      ;;
+  esac
+  VERIFY_KV_SUFFIX="-v${VERIFY_KV_SCORE_TAG}"
+  if [ "${VERIFY_KV_SCORE_SOURCE}" = "scope" ]; then
+    VERIFY_KV_SUFFIX="${VERIFY_KV_SUFFIX}${VERIFY_KV_SCOPE_BETA1}x${VERIFY_KV_SCOPE_BETA2}"
+    if [ "${VERIFY_KV_DYNAMIC_STATUS}" = "enabled" ]; then
+      VERIFY_KV_SUFFIX="${VERIFY_KV_SUFFIX}-d${VERIFY_KV_DYNAMIC_MIN_BETA1}"
+    fi
+  elif [ -n "${VERIFY_KV_RETAIN_RATIO}" ]; then
+    VERIFY_KV_SUFFIX="${VERIFY_KV_SUFFIX}-r${VERIFY_KV_RETAIN_RATIO}"
+  fi
+  if [ "${VERIFY_KV_BOOTSTRAP_FULL_STEPS}" != "0" ]; then
+    VERIFY_KV_SUFFIX="${VERIFY_KV_SUFFIX}-b${VERIFY_KV_BOOTSTRAP_FULL_STEPS}"
+  fi
+  if [ "${VERIFY_KV_SAFE_COMMIT_STATUS}" = "enabled" ]; then
+    VERIFY_KV_SUFFIX="${VERIFY_KV_SUFFIX}-sc"
+  fi
 fi
-MODEL_RUN_NAME="${MODEL_NAME}-swift-${torch_dtype}-temp-${TEMP}-top-p-${TOP_P}-seed-${SEED}-max_new_tokens-${MAX_NEW_TOKENS}-opt_interval-${OPT_INTERVAL}-max_score-${MAX_SCORE}-context_window-${CONTEXT_WINDOW}-skip_ratio-${SKIP_RATIO}-draft_kv_retain_ratio-${RETAIN_RATIO_RUN_NAME}-opt_compressed_draft_kv-True${DRAFT_KV_CACHE_SUFFIX}${DRAFT_KV_SCORE_SUFFIX}${DRAFT_TOKEN_SUFFIX}"
+MODEL_RUN_NAME="${MODEL_NAME}-swift-${torch_dtype}-temp-${TEMP}-top-p-${TOP_P}-seed-${SEED}-max_new_tokens-${MAX_NEW_TOKENS}-opt_interval-${OPT_INTERVAL}-max_score-${MAX_SCORE}-context_window-${CONTEXT_WINDOW}-skip_ratio-${SKIP_RATIO}-draft_kv_retain_ratio-${RETAIN_RATIO_RUN_NAME}-opt_compressed_draft_kv-True${DRAFT_KV_SCORE_SUFFIX}${VERIFY_KV_SUFFIX}${DRAFT_TOKEN_SUFFIX}"
 ANSWER_FILE="outputs/${TASK_NAME}/${TASK_NAME}_${DATA_NUM}/without_layerskip_draft_model_answer/${MODEL_NAME}/${MODEL_RUN_NAME}.jsonl"
 LOG_FILE="${ANSWER_FILE%.jsonl}.log"
+TRACE_RUN_HASH=$(printf '%s' "${MODEL_RUN_NAME}" | sha1sum | cut -c1-12)
+FLOPS_TRACE_FILE="$(dirname "${ANSWER_FILE}")/${MODEL_NAME}-flops-${TRACE_RUN_HASH}.jsonl"
+
+FLOPS_TRACE_ARGS=()
+if [ "${FLOPS_TRACE_STATUS}" = "enabled" ]; then
+  FLOPS_TRACE_ARGS=(
+    --flops-trace
+    --flops-trace-file "${FLOPS_TRACE_FILE}"
+  )
+fi
 
 
 baseline_answer_file() {
@@ -502,9 +828,29 @@ echo "Lyapunov adaptive: ${LYAPUNOV_ADAPTIVE_STATUS}"
 echo "Adaptive cold start: ${ADAPTIVE_COLD_START_STATUS}"
 echo "Adaptive layer fallback: ${ADAPTIVE_LAYER_STATUS}"
 echo "Adaptive ratio ladder: ${ADAPTIVE_RATIO_LADDER}"
+case "${TASK_NAME}" in
+  long_gsm8k)
+    echo "LongGenBench base task: gsm8k, batch size: ${LONGGEN_GSM8K_BATCH_SIZE:-${LONGGEN_BATCH_SIZE:-30}}, shots: ${LONGGEN_GSM8K_NUM_SHOTS:-${LONGGEN_NUM_SHOTS:-8}}"
+    ;;
+  long_mmlu)
+    echo "LongGenBench base task: mmlu, batch size: ${LONGGEN_MMLU_BATCH_SIZE:-${LONGGEN_BATCH_SIZE:-30}}, shots: ${LONGGEN_MMLU_NUM_SHOTS:-${LONGGEN_NUM_SHOTS:-5}}"
+    ;;
+esac
 echo "Draft KV cache mode: ${DRAFT_KV_CACHE_MODE}"
 echo "Draft KV score source: ${DRAFT_KV_SCORE_SOURCE}, reuse EMA: ${DRAFT_KV_REUSE_EMA}"
+echo "Verify KV compression: ${VERIFY_KV_STATUS}"
+if [ "${VERIFY_KV_STATUS}" = "enabled" ]; then
+  if [ "${VERIFY_KV_SCORE_SOURCE}" = "scope" ]; then
+    echo "Verify KV cache mode: ${VERIFY_KV_CACHE_MODE}, score source: ${VERIFY_KV_SCORE_SOURCE}, bootstrap full steps: ${VERIFY_KV_BOOTSTRAP_FULL_STEPS}, scope beta1: ${VERIFY_KV_SCOPE_BETA1}, scope beta2: ${VERIFY_KV_SCOPE_BETA2}, dynamic: ${VERIFY_KV_DYNAMIC_STATUS}, safe commit: ${VERIFY_KV_SAFE_COMMIT_STATUS}"
+    if [ "${VERIFY_KV_DYNAMIC_STATUS}" = "enabled" ]; then
+      echo "Verify KV dynamic: min_beta1=${VERIFY_KV_DYNAMIC_MIN_BETA1}, max_beta1=${VERIFY_KV_DYNAMIC_MAX_BETA1:-${VERIFY_KV_SCOPE_BETA1}}, step=${VERIFY_KV_DYNAMIC_STEP}, window=${VERIFY_KV_DYNAMIC_WINDOW}, acceptance_floor=${VERIFY_KV_DYNAMIC_ACCEPTANCE_FLOOR}, mean_floor=${VERIFY_KV_DYNAMIC_MEAN_FLOOR}, confidence_floor=${VERIFY_KV_DYNAMIC_CONFIDENCE_FLOOR}, confidence_low=${VERIFY_KV_DYNAMIC_CONFIDENCE_LOW}"
+    fi
+  else
+    echo "Verify KV cache mode: ${VERIFY_KV_CACHE_MODE}, score source: ${VERIFY_KV_SCORE_SOURCE}, retain ratio: ${VERIFY_KV_RETAIN_RATIO:-current-adaptive}, bootstrap full steps: ${VERIFY_KV_BOOTSTRAP_FULL_STEPS}, safe commit: ${VERIFY_KV_SAFE_COMMIT_STATUS}"
+  fi
+fi
 echo "Write log: ${WRITE_LOG_STATUS}"
+echo "FLOPs trace: ${FLOPS_TRACE_STATUS}"
 if [ "${LYAPUNOV_ADAPTIVE_STATUS}" = "enabled" ]; then
   echo "Lyapunov target=${LYAPUNOV_ACCEPTANCE_TARGET}, V=${LYAPUNOV_V}, switch_cost=${LYAPUNOV_SWITCH_COST}, layer_penalty=${LYAPUNOV_LAYER_PENALTY_WEIGHT}"
 fi
@@ -522,6 +868,11 @@ if [ "${WRITE_LOG_STATUS}" = "enabled" ]; then
   echo "Log to ${LOG_FILE}"
 else
   echo "Log disabled; set WRITE_LOG=1 to write ${LOG_FILE}"
+fi
+if [ "${FLOPS_TRACE_STATUS}" = "enabled" ]; then
+  echo "FLOPs trace to ${FLOPS_TRACE_FILE}"
+else
+  echo "FLOPs trace disabled; set FLOPS_TRACE=1 to write ${FLOPS_TRACE_FILE}"
 fi
 
 run_swift_eval() {
@@ -549,6 +900,8 @@ run_swift_eval() {
     --draft-kv-cache-mode "${DRAFT_KV_CACHE_MODE}" \
     --draft-kv-score-source "${DRAFT_KV_SCORE_SOURCE}" \
     --draft-kv-reuse-ema "${DRAFT_KV_REUSE_EMA}" \
+    "${VERIFY_KV_ARGS[@]}" \
+    "${FLOPS_TRACE_ARGS[@]}" \
     --optimize-with-compressed-draft-kv \
     --cosine-prefill-skip-layers \
     --cosine-skip-mode "${COSINE_SKIP_MODE}" \

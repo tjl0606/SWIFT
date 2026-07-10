@@ -4,7 +4,10 @@ Usage:
 python3 gen_model_answer.py --model-path lmsys/fastchat-t5-3b-v1.0 --model-id fastchat-t5-3b-v1.0
 """
 import argparse
+import hashlib
+import json
 import math
+import os
 import re
 import time
 from pyexpat import model
@@ -70,6 +73,8 @@ def retain_ratio_run_name(args):
             return "dynamic3"
         if getattr(args, "cosine_prefill_skip_layers", False):
             if getattr(args, "adaptive_cold_start", False):
+                if getattr(args, "verify_kv_compress", False):
+                    return "dynamic-6-2"
                 return "dynamic-6"
             if getattr(args, "lyapunov_adaptive_controller", False):
                 return "dynamic-5-lyapunov"
@@ -109,6 +114,468 @@ def _ratio_key(retain_ratio):
 
 def _adaptive_step_config_key(retain_ratio, attn_skip_count):
     return f"ratio-{float(retain_ratio):.4f}|attn-{int(attn_skip_count)}"
+
+
+def _json_safe_value(value):
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 1:
+            return _json_safe_value(value.detach().cpu().item())
+        return [_json_safe_value(item) for item in value.detach().cpu().tolist()]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+    return value
+
+
+def _flops_trace_enabled(statistics):
+    return bool(statistics and statistics.get("flops_trace_enabled", False))
+
+
+def _flops_trace_file(statistics):
+    if not statistics:
+        return None
+    trace_file = statistics.get("flops_trace_file")
+    return str(trace_file) if trace_file else None
+
+
+def _write_flops_trace(statistics, entry):
+    if not _flops_trace_enabled(statistics):
+        return
+    trace_file = _flops_trace_file(statistics)
+    if not trace_file:
+        return
+    trace_dir = os.path.dirname(os.path.expanduser(trace_file))
+    if trace_dir:
+        os.makedirs(trace_dir, exist_ok=True)
+    with open(os.path.expanduser(trace_file), "a", encoding="utf-8") as fout:
+        fout.write(json.dumps(_json_safe_value(entry), ensure_ascii=False) + "\n")
+
+
+def _model_flop_config(model):
+    config = getattr(model, "config", None)
+    if config is None:
+        return {}
+    hidden_size = int(getattr(config, "hidden_size", 0) or 0)
+    num_heads = int(getattr(config, "num_attention_heads", 0) or 0)
+    num_kv_heads = int(getattr(config, "num_key_value_heads", num_heads) or num_heads or 0)
+    head_dim = hidden_size // num_heads if num_heads > 0 else int(getattr(config, "head_dim", 0) or 0)
+    kv_dim = num_kv_heads * head_dim
+    return {
+        "num_hidden_layers": int(getattr(config, "num_hidden_layers", 0) or 0),
+        "hidden_size": hidden_size,
+        "intermediate_size": int(getattr(config, "intermediate_size", 0) or 0),
+        "vocab_size": int(getattr(config, "vocab_size", 0) or 0),
+        "num_attention_heads": num_heads,
+        "num_key_value_heads": num_kv_heads,
+        "head_dim": int(head_dim),
+        "kv_dim": int(kv_dim),
+        "macs_are_two_flops": True,
+        "notes": (
+            "Estimated core FLOPs include attention projections, attention QK/AV, "
+            "and MLP matmuls. LM-head FLOPs are reported separately. "
+            "physical uses the actual dense KV tensor length; logical uses the "
+            "visible/selected KV length."
+        ),
+    }
+
+
+def _layer_flop_terms(model):
+    cfg = _model_flop_config(model)
+    hidden_size = int(cfg.get("hidden_size", 0))
+    intermediate_size = int(cfg.get("intermediate_size", 0))
+    kv_dim = int(cfg.get("kv_dim", hidden_size))
+    vocab_size = int(cfg.get("vocab_size", 0))
+    return {
+        "attn_projection_per_token": int(4 * hidden_size * hidden_size + 4 * hidden_size * kv_dim),
+        "attention_per_kv": int(4 * hidden_size),
+        "mlp_per_token": int(6 * hidden_size * intermediate_size),
+        "lm_head_per_token": int(2 * hidden_size * vocab_size),
+    }
+
+
+def _estimate_component_flops(model, q_tokens, attention_kv_len_sum,
+                              attn_layer_count, mlp_layer_count, include_lm_head=True):
+    q_tokens = max(0, int(q_tokens))
+    attention_kv_len_sum = max(0, int(attention_kv_len_sum))
+    attn_layer_count = max(0, int(attn_layer_count))
+    mlp_layer_count = max(0, int(mlp_layer_count))
+    terms = _layer_flop_terms(model)
+    attn_projection = attn_layer_count * q_tokens * terms["attn_projection_per_token"]
+    attention_matmul = attn_layer_count * attention_kv_len_sum * terms["attention_per_kv"]
+    mlp = mlp_layer_count * q_tokens * terms["mlp_per_token"]
+    lm_head = q_tokens * terms["lm_head_per_token"] if include_lm_head else 0
+    return {
+        "attn_projection": int(attn_projection),
+        "attention_matmul": int(attention_matmul),
+        "mlp": int(mlp),
+        "core": int(attn_projection + attention_matmul + mlp),
+        "lm_head": int(lm_head),
+        "core_plus_lm_head": int(attn_projection + attention_matmul + mlp + lm_head),
+    }
+
+
+def _sum_estimated_flops(statistics, prefix, estimate):
+    if statistics is None or not estimate:
+        return
+    for key, value in estimate.items():
+        statistics[f"flops_estimated_{prefix}_{key}_sum"] = int(
+            statistics.get(f"flops_estimated_{prefix}_{key}_sum", 0)
+        ) + int(value)
+
+
+def _current_skip_layers_for_trace(model):
+    if not hasattr(model, "get_skip_layers"):
+        return [], []
+    attn_skip_layers, mlp_skip_layers = model.get_skip_layers()
+    return (
+        sorted(int(layer_id) for layer_id in list(attn_skip_layers)),
+        sorted(int(layer_id) for layer_id in list(mlp_skip_layers)),
+    )
+
+
+def _attention_edge_count_from_swift_buffers(swift_buffers, q_len):
+    swift_mask = None
+    if swift_buffers is not None:
+        swift_mask = swift_buffers.get("swift_attn_mask")
+    if swift_mask is None:
+        q_len = max(0, int(q_len))
+        return q_len * (q_len + 1) // 2
+    mask = swift_mask
+    while getattr(mask, "dim", lambda: 0)() > 2:
+        mask = mask[0]
+    mask = mask.detach()
+    return int(mask.to(torch.bool).sum().item())
+
+
+def _kv_trace_lengths(model, prefix, fallback_full_len, compressed_enabled, cache_mode):
+    fallback_full_len = max(0, int(fallback_full_len))
+    keep_indices = getattr(model, f"{prefix}_last_keep_indices", None)
+    mapped_full_len = int(getattr(model, f"{prefix}_last_full_len", 0) or 0)
+    mapped_cache_mode = getattr(model, f"{prefix}_last_cache_mode", None)
+    if keep_indices is not None and int(keep_indices.numel()) > 0:
+        visible_len = int(keep_indices.numel())
+        full_len = mapped_full_len if mapped_full_len > 0 else fallback_full_len
+        actual_mode = str(mapped_cache_mode or cache_mode or "copy")
+        physical_len = full_len if actual_mode == "mask" else visible_len
+        compressed = visible_len < full_len
+    else:
+        full_len = fallback_full_len
+        visible_len = fallback_full_len
+        physical_len = fallback_full_len
+        actual_mode = "full"
+        compressed = False
+    return {
+        "enabled": bool(compressed_enabled),
+        "cache_mode": actual_mode,
+        "full_len": int(full_len),
+        "visible_len": int(visible_len),
+        "physical_len": int(physical_len),
+        "compressed": bool(compressed),
+    }
+
+
+def _capture_draft_trace(model, statistics, full_input_ids, top1_prob):
+    draft_token_count = len(top1_prob) if top1_prob is not None else 0
+    full_len = int(full_input_ids.shape[1]) if full_input_ids is not None else 0
+    attn_skip_layers, mlp_skip_layers = _current_skip_layers_for_trace(model)
+    num_layers = int(getattr(getattr(model, "config", None), "num_hidden_layers", 0) or 0)
+    kv_lengths = _kv_trace_lengths(
+        model,
+        "draft_kv",
+        fallback_full_len=full_len,
+        compressed_enabled=bool(getattr(model, "draft_kv_compress", False)),
+        cache_mode=getattr(model, "draft_kv_cache_mode", statistics.get("draft_kv_cache_mode", "copy")),
+    )
+    visible_sum = sum(kv_lengths["visible_len"] + offset + 1 for offset in range(draft_token_count))
+    physical_sum = sum(kv_lengths["physical_len"] + offset + 1 for offset in range(draft_token_count))
+    executed_attn_layers = max(0, num_layers - len(attn_skip_layers))
+    executed_mlp_layers = max(0, num_layers - len(mlp_skip_layers))
+    return {
+        "token_count": int(draft_token_count),
+        "retain_ratio": float(getattr(model, "draft_kv_retain_ratio", statistics.get("draft_kv_retain_ratio", 1.0))),
+        "kv": kv_lengths,
+        "attn_skip_layers": attn_skip_layers,
+        "mlp_skip_layers": mlp_skip_layers,
+        "attn_skip_count": int(len(attn_skip_layers)),
+        "mlp_skip_count": int(len(mlp_skip_layers)),
+        "executed_attn_layers": int(executed_attn_layers),
+        "executed_mlp_layers": int(executed_mlp_layers),
+        "attention_kv_len_sum_logical": int(visible_sum),
+        "attention_kv_len_sum_physical": int(physical_sum),
+        "estimated_flops_logical": _estimate_component_flops(
+            model,
+            draft_token_count,
+            visible_sum,
+            executed_attn_layers,
+            executed_mlp_layers,
+            include_lm_head=True,
+        ),
+        "estimated_flops_physical": _estimate_component_flops(
+            model,
+            draft_token_count,
+            physical_sum,
+            executed_attn_layers,
+            executed_mlp_layers,
+            include_lm_head=True,
+        ),
+    }
+
+
+def _capture_verify_trace(model, statistics, input_ids, tree_candidates, swift_buffers,
+                          used_approx_verify_kv, safe_verify_commit=False):
+    full_len = int(input_ids.shape[1]) if input_ids is not None else 0
+    q_len = int(tree_candidates.shape[1]) if tree_candidates is not None else 0
+    num_layers = int(getattr(getattr(model, "config", None), "num_hidden_layers", 0) or 0)
+    kv_lengths = _kv_trace_lengths(
+        model,
+        "verify_kv",
+        fallback_full_len=full_len,
+        compressed_enabled=bool(statistics.get("verify_kv_compress", False)),
+        cache_mode=statistics.get("verify_kv_cache_mode", "copy"),
+    )
+    tree_edges = _attention_edge_count_from_swift_buffers(swift_buffers, q_len)
+    logical_sum = q_len * kv_lengths["visible_len"] + tree_edges
+    physical_sum = q_len * (kv_lengths["physical_len"] + q_len)
+    return {
+        "q_len": int(q_len),
+        "used_approx_kv": bool(used_approx_verify_kv),
+        "safe_commit": bool(safe_verify_commit),
+        "kv": kv_lengths,
+        "score_source": statistics.get("verify_kv_score_source"),
+        "retain_ratio": statistics.get("verify_kv_retain_ratio"),
+        "scope_beta1": int(statistics.get("verify_kv_scope_beta1", 0) or 0),
+        "scope_beta2": int(statistics.get("verify_kv_scope_beta2", 0) or 0),
+        "tree_attention_edges_logical": int(tree_edges),
+        "attention_kv_len_sum_logical": int(logical_sum),
+        "attention_kv_len_sum_physical": int(physical_sum),
+        "executed_attn_layers": int(num_layers),
+        "executed_mlp_layers": int(num_layers),
+        "estimated_flops_logical": _estimate_component_flops(
+            model,
+            q_len,
+            logical_sum,
+            num_layers,
+            num_layers,
+            include_lm_head=True,
+        ),
+        "estimated_flops_physical": _estimate_component_flops(
+            model,
+            q_len,
+            physical_sum,
+            num_layers,
+            num_layers,
+            include_lm_head=True,
+        ),
+    }
+
+
+def _prefill_attention_kv_len_sum(prompt_len, logical=False):
+    prompt_len = max(0, int(prompt_len))
+    if logical:
+        return prompt_len * (prompt_len + 1) // 2
+    return prompt_len * prompt_len
+
+
+def _record_flops_prefill(statistics, model, prompt_len):
+    if not _flops_trace_enabled(statistics):
+        return
+    num_layers = int(getattr(getattr(model, "config", None), "num_hidden_layers", 0) or 0)
+    logical_sum = _prefill_attention_kv_len_sum(prompt_len, logical=True)
+    physical_sum = _prefill_attention_kv_len_sum(prompt_len, logical=False)
+    estimate_logical = _estimate_component_flops(
+        model,
+        prompt_len,
+        logical_sum,
+        num_layers,
+        num_layers,
+        include_lm_head=True,
+    )
+    estimate_physical = _estimate_component_flops(
+        model,
+        prompt_len,
+        physical_sum,
+        num_layers,
+        num_layers,
+        include_lm_head=True,
+    )
+    _sum_estimated_flops(statistics, "prefill_logical", estimate_logical)
+    _sum_estimated_flops(statistics, "prefill_physical", estimate_physical)
+    statistics["flops_trace_prefill_count"] = int(statistics.get("flops_trace_prefill_count", 0)) + 1
+    _write_flops_trace(statistics, {
+        "record_type": "prefill",
+        "phase": statistics.get("flops_trace_phase", "eval"),
+        "question_index": statistics.get("flops_trace_question_index"),
+        "question_id": statistics.get("flops_trace_question_id"),
+        "turn_index": statistics.get("flops_trace_turn_index"),
+        "prompt_len": int(prompt_len),
+        "num_layers": int(num_layers),
+        "attention_kv_len_sum_logical": int(logical_sum),
+        "attention_kv_len_sum_physical": int(physical_sum),
+        "estimated_flops_logical": estimate_logical,
+        "estimated_flops_physical": estimate_physical,
+    })
+
+
+def _accumulate_flops_trace_step(statistics, draft_trace, verify_trace,
+                                 safe_commit_trace=None):
+    if statistics is None:
+        return
+    statistics["flops_trace_step_count"] = int(statistics.get("flops_trace_step_count", 0)) + 1
+    if draft_trace:
+        statistics["flops_trace_draft_token_count"] = int(
+            statistics.get("flops_trace_draft_token_count", 0)
+        ) + int(draft_trace.get("token_count", 0))
+        statistics["flops_trace_draft_kv_visible_len_sum"] = int(
+            statistics.get("flops_trace_draft_kv_visible_len_sum", 0)
+        ) + int(draft_trace.get("kv", {}).get("visible_len", 0))
+        statistics["flops_trace_draft_kv_physical_len_sum"] = int(
+            statistics.get("flops_trace_draft_kv_physical_len_sum", 0)
+        ) + int(draft_trace.get("kv", {}).get("physical_len", 0))
+        statistics["flops_trace_draft_attn_skip_count_sum"] = int(
+            statistics.get("flops_trace_draft_attn_skip_count_sum", 0)
+        ) + int(draft_trace.get("attn_skip_count", 0))
+        statistics["flops_trace_draft_mlp_skip_count_sum"] = int(
+            statistics.get("flops_trace_draft_mlp_skip_count_sum", 0)
+        ) + int(draft_trace.get("mlp_skip_count", 0))
+        _sum_estimated_flops(statistics, "draft_logical", draft_trace.get("estimated_flops_logical", {}))
+        _sum_estimated_flops(statistics, "draft_physical", draft_trace.get("estimated_flops_physical", {}))
+    if verify_trace:
+        statistics["flops_trace_verify_q_token_count"] = int(
+            statistics.get("flops_trace_verify_q_token_count", 0)
+        ) + int(verify_trace.get("q_len", 0))
+        statistics["flops_trace_verify_kv_visible_len_sum"] = int(
+            statistics.get("flops_trace_verify_kv_visible_len_sum", 0)
+        ) + int(verify_trace.get("kv", {}).get("visible_len", 0))
+        statistics["flops_trace_verify_kv_physical_len_sum"] = int(
+            statistics.get("flops_trace_verify_kv_physical_len_sum", 0)
+        ) + int(verify_trace.get("kv", {}).get("physical_len", 0))
+        if verify_trace.get("used_approx_kv", False):
+            statistics["flops_trace_verify_approx_steps"] = int(
+                statistics.get("flops_trace_verify_approx_steps", 0)
+            ) + 1
+        _sum_estimated_flops(statistics, "verify_logical", verify_trace.get("estimated_flops_logical", {}))
+        _sum_estimated_flops(statistics, "verify_physical", verify_trace.get("estimated_flops_physical", {}))
+    if safe_commit_trace:
+        _sum_estimated_flops(statistics, "safe_commit_logical", safe_commit_trace.get("estimated_flops_logical", {}))
+        _sum_estimated_flops(statistics, "safe_commit_physical", safe_commit_trace.get("estimated_flops_physical", {}))
+
+
+def _safe_commit_trace(model, input_len, accepted_token_count):
+    num_layers = int(getattr(getattr(model, "config", None), "num_hidden_layers", 0) or 0)
+    accepted_token_count = max(0, int(accepted_token_count))
+    input_len = max(0, int(input_len))
+    logical_sum = sum(input_len + offset + 1 for offset in range(accepted_token_count))
+    physical_sum = logical_sum
+    return {
+        "q_len": int(accepted_token_count),
+        "attention_kv_len_sum_logical": int(logical_sum),
+        "attention_kv_len_sum_physical": int(physical_sum),
+        "estimated_flops_logical": _estimate_component_flops(
+            model,
+            accepted_token_count,
+            logical_sum,
+            num_layers,
+            num_layers,
+            include_lm_head=False,
+        ),
+        "estimated_flops_physical": _estimate_component_flops(
+            model,
+            accepted_token_count,
+            physical_sum,
+            num_layers,
+            num_layers,
+            include_lm_head=False,
+        ),
+    }
+
+
+def _record_flops_step(statistics, model, step_entry):
+    if not _flops_trace_enabled(statistics):
+        return
+    _accumulate_flops_trace_step(
+        statistics,
+        step_entry.get("draft"),
+        step_entry.get("verify"),
+        step_entry.get("safe_commit"),
+    )
+    _write_flops_trace(statistics, step_entry)
+
+
+def _record_flops_sample_summary(statistics, input_len, new_token_num, step_count,
+                                 accept_length_list, draft_token_num):
+    if not _flops_trace_enabled(statistics):
+        return
+    accepted_draft_tokens = max(0, int(sum(accept_length_list) - len(accept_length_list)))
+    token_acceptance_rate = (
+        accepted_draft_tokens / float(draft_token_num)
+        if int(draft_token_num) > 0
+        else 0.0
+    )
+    statistics["flops_trace_sample_count"] = int(statistics.get("flops_trace_sample_count", 0)) + 1
+    statistics["flops_trace_generated_token_count"] = int(
+        statistics.get("flops_trace_generated_token_count", 0)
+    ) + int(new_token_num)
+    statistics["flops_trace_accepted_draft_token_count"] = int(
+        statistics.get("flops_trace_accepted_draft_token_count", 0)
+    ) + int(accepted_draft_tokens)
+    _write_flops_trace(statistics, {
+        "record_type": "sample_summary",
+        "phase": statistics.get("flops_trace_phase", "eval"),
+        "question_index": statistics.get("flops_trace_question_index"),
+        "question_id": statistics.get("flops_trace_question_id"),
+        "turn_index": statistics.get("flops_trace_turn_index"),
+        "prompt_len": int(input_len),
+        "new_token_num": int(new_token_num),
+        "step_count": int(step_count),
+        "draft_token_num": int(draft_token_num),
+        "accepted_draft_tokens": int(accepted_draft_tokens),
+        "mean_accepted_tokens": (
+            float(sum(accept_length_list) / len(accept_length_list))
+            if accept_length_list
+            else 0.0
+        ),
+        "token_acceptance_rate": float(token_acceptance_rate),
+    })
+
+
+def _initialize_flops_trace_file(statistics, model, args, answer_file):
+    if not statistics.get("flops_trace_enabled", False):
+        return
+    trace_file = statistics.get("flops_trace_file")
+    if not trace_file:
+        root, _ext = os.path.splitext(answer_file)
+        trace_hash = hashlib.sha1(os.path.abspath(answer_file).encode("utf-8")).hexdigest()[:12]
+        trace_file = os.path.join(os.path.dirname(root), f"flops_trace-{trace_hash}.jsonl")
+        statistics["flops_trace_file"] = trace_file
+    trace_dir = os.path.dirname(os.path.expanduser(trace_file))
+    if trace_dir:
+        os.makedirs(trace_dir, exist_ok=True)
+    meta = {
+        "record_type": "run_meta",
+        "task_name": args.task_name,
+        "model_id": args.model_id,
+        "answer_file": answer_file,
+        "trace_file": trace_file,
+        "model_flop_config": _model_flop_config(model),
+        "draft_kv_compress": bool(args.draft_kv_compress),
+        "draft_kv_cache_mode": args.draft_kv_cache_mode,
+        "draft_kv_score_source": args.draft_kv_score_source,
+        "verify_kv_compress": bool(args.verify_kv_compress),
+        "verify_kv_cache_mode": args.verify_kv_cache_mode,
+        "verify_kv_score_source": args.verify_kv_score_source,
+        "verify_kv_dynamic": bool(args.verify_kv_dynamic),
+        "local_adaptive_controller": bool(args.local_adaptive_controller),
+        "adaptive_final2_controller": bool(args.adaptive_final2_controller),
+        "adaptive_cold_start": bool(args.adaptive_cold_start),
+    }
+    with open(os.path.expanduser(trace_file), "w", encoding="utf-8") as fout:
+        fout.write(json.dumps(_json_safe_value(meta), ensure_ascii=False) + "\n")
 
 
 def _current_attn_skip_count(model, statistics=None):
@@ -326,6 +793,29 @@ def _merge_adaptive_cold_start_stats(statistics, cold_statistics):
     statistics["adaptive_cold_start_effective_step_count"] = int(statistics.get("adaptive_cold_start_effective_step_count", 0)) + merged_steps
 
 
+def _merge_cold_start_flops_stats(statistics, cold_statistics):
+    if not _flops_trace_enabled(statistics):
+        return
+    for key, value in cold_statistics.items():
+        if key.startswith("flops_estimated_"):
+            target_key = key.replace("flops_estimated_", "flops_cold_start_estimated_", 1)
+        elif key.startswith("flops_trace_"):
+            if key in {
+                "flops_trace_enabled",
+                "flops_trace_file",
+                "flops_trace_phase",
+                "flops_trace_question_index",
+                "flops_trace_question_id",
+                "flops_trace_turn_index",
+            }:
+                continue
+            target_key = key.replace("flops_trace_", "flops_cold_start_trace_", 1)
+        else:
+            continue
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            statistics[target_key] = statistics.get(target_key, 0) + value
+
+
 def _build_cold_start_statistics(statistics, retain_ratio=None, mode="probe"):
     # Cold start runs in an isolated statistics dict.  Only the config table is
     # merged back, so warmup KV state and global acceptance references do not
@@ -366,6 +856,10 @@ def _build_cold_start_statistics(statistics, retain_ratio=None, mode="probe"):
         "drafted_tokens": [],
         "adaptive_switch_events": [],
         "final2_decisions": [],
+        "flops_trace_phase": "adaptive_cold_start",
+        "flops_trace_question_index": "adaptive_cold_start",
+        "flops_trace_question_id": "adaptive_cold_start",
+        "flops_trace_turn_index": None,
     })
     return cold_statistics
 
@@ -450,6 +944,7 @@ def run_adaptive_cold_start(model, tokenizer, statistics, logits_processor=None)
                 max_steps=max_steps,
             )
             _merge_adaptive_cold_start_stats(statistics, cold_statistics)
+            _merge_cold_start_flops_stats(statistics, cold_statistics)
             raw_steps += int(step_count)
             raw_new_tokens += int(new_token_num)
             raw_draft_tokens += int(draft_token_num)
@@ -2140,7 +2635,9 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
     model.draft_kv_cache_mode = statistics.get("draft_kv_cache_mode", "copy")
     model.draft_kv_score_source = statistics.get("draft_kv_score_source", "heuristic")
     reset_draft_attention_reuse(model)
+    statistics["verify_kv_sample_step"] = 0
     statistics["adaptive_last_sample"] = None
+    statistics.setdefault("flops_trace_phase", "eval")
     local_adaptive_state = None
     if _local_adaptive_ready(statistics):
         local_adaptive_state = _initialize_local_adaptive_state(statistics, model)
@@ -2149,6 +2646,7 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
     eos_token_ids = _get_eos_token_ids(model, tokenizer)
 
     input_len = input_ids.shape[1]
+    statistics["verify_kv_prefill_len"] = int(input_len)
     cur_length = input_len
     reset_swift_mode(model)
     swift_logits, sample_token, top1_prob = initialize_swift(input_ids, model, max_new_tokens,
@@ -2156,6 +2654,8 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
                                                              current_length_data, logits_processor=logits_processor,
                                                              statistics=statistics,
                                                              draft_token_num=fixed_draft_token_num)
+    _record_flops_prefill(statistics, model, input_len)
+    pending_draft_trace = _capture_draft_trace(model, statistics, input_ids, top1_prob)
 
     # Clone the prefilled past key and value states for swift optimization
     input_past_key_values_data = []
@@ -2167,6 +2667,9 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
     draft_token_num = 0
     total_acc_num = 0
     for idx in range(max_steps):
+        step_input_len_before = int(cur_length)
+        step_new_token_num_before = int(new_token_num)
+        draft_trace = pending_draft_trace
         # drafted tokens + 1 bonus verified token
         step_draft_token_num = len(top1_prob)
         draft_token_num += step_draft_token_num
@@ -2185,19 +2688,69 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             logits_processor
         )
 
-        logits, outputs = tree_decoding(
+        (
+            logits,
+            outputs,
+            verify_kv_source_data,
+            verify_kv_source_base_offset,
+            used_approx_verify_kv,
+        ) = tree_decoding(
             model,
             tree_candidates,
             past_key_values,
             swift_buffers["swift_position_ids"],
             input_ids,
             swift_buffers["retrieve_indices"],
+            past_key_values_data=past_key_values_data,
+            current_length_data=current_length_data,
+            statistics=statistics,
         )
 
         best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor, cart_candidates_prob, swift_logits[2],
                 swift_buffers["p_indices"], tree_candidates, swift_buffers["b_indices"]
             )
+        verify_margin, verify_min_margin = verify_confidence_margin(
+            logits,
+            best_candidate,
+            accept_length,
+        )
+
+        safe_verify_commit = (
+            statistics.get("verify_kv_safe_commit", False)
+            and used_approx_verify_kv
+        )
+        verify_trace = _capture_verify_trace(
+            model,
+            statistics,
+            input_ids,
+            tree_candidates,
+            swift_buffers,
+            used_approx_verify_kv=used_approx_verify_kv,
+            safe_verify_commit=safe_verify_commit,
+        )
+        safe_commit_trace = None
+        if safe_verify_commit:
+            accepted_tokens = candidates[
+                None,
+                best_candidate,
+                : accept_length + 1,
+            ].to(input_ids.device)
+            if recompute_accepted_kv_full_context(
+                model,
+                past_key_values_data,
+                current_length_data,
+                input_ids,
+                accepted_tokens,
+            ):
+                safe_commit_trace = _safe_commit_trace(
+                    model,
+                    input_len=int(input_ids.shape[1]),
+                    accepted_token_count=int(accepted_tokens.shape[1]),
+                )
+                statistics["verify_kv_safe_commit_uses"] = (
+                    int(statistics.get("verify_kv_safe_commit_uses", 0)) + 1
+                )
 
         input_ids, new_token_num, sample_token = update_inference_inputs(
             input_ids,
@@ -2209,7 +2762,10 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             new_token_num,
             past_key_values_data,
             current_length_data,
-            sample_p
+            sample_p,
+            kv_source_data_list=verify_kv_source_data,
+            kv_source_base_offset=verify_kv_source_base_offset,
+            precommitted_kv=safe_verify_commit,
         )
 
         if statistics.get("log_draft_tokens", False):
@@ -2242,7 +2798,9 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
         cur_length = accept_length_tree + cur_length
         accept_length_list.append(accept_length_tree)
         total_acc_num += accept_length_tree - 1
-        if statistics.get("draft_kv_score_source") == "reuse":
+        if statistics.get("draft_kv_score_source") == "reuse" or (
+                statistics.get("verify_kv_compress")
+                and statistics.get("verify_kv_score_source") == "reuse"):
             apply_draft_attention_reuse_reward(
                 model,
                 accepted_draft_tokens=accept_length_tree - 1,
@@ -2255,6 +2813,15 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             or _should_stop_generation(input_ids, input_len, tokenizer, stop_patterns, stop_config)
             or new_token_num > max_new_tokens
         )
+        update_verify_kv_dynamic_controller(
+            statistics,
+            accepted_total_tokens=accept_length_tree,
+            accepted_draft_tokens=accept_length_tree - 1,
+            drafted_tokens=step_draft_token_num,
+            confidence_margin=verify_margin,
+            confidence_min=verify_min_margin,
+            allow_switch=not should_stop,
+        )
         _update_local_adaptive_controller(
             statistics,
             model,
@@ -2264,6 +2831,46 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             step_draft_token_num,
             allow_switch=not should_stop,
         )
+        next_attn_skip_layers, next_mlp_skip_layers = _current_skip_layers_for_trace(model)
+        _record_flops_step(statistics, model, {
+            "record_type": "swift_step",
+            "phase": statistics.get("flops_trace_phase", "eval"),
+            "question_index": statistics.get("flops_trace_question_index"),
+            "question_id": statistics.get("flops_trace_question_id"),
+            "turn_index": statistics.get("flops_trace_turn_index"),
+            "step": int(idx),
+            "input_len_before_step": int(step_input_len_before),
+            "new_token_num_before_step": int(step_new_token_num_before),
+            "new_token_num_after_step": int(new_token_num),
+            "max_new_tokens": int(max_new_tokens),
+            "draft": draft_trace,
+            "verify": verify_trace,
+            "safe_commit": safe_commit_trace,
+            "accept": {
+                "accepted_total_tokens": int(accept_length_tree),
+                "accepted_draft_tokens": int(accept_length_tree - 1),
+                "drafted_tokens": int(step_draft_token_num),
+                "token_acceptance_rate": (
+                    float(max(0, accept_length_tree - 1) / step_draft_token_num)
+                    if step_draft_token_num > 0
+                    else 0.0
+                ),
+                "best_candidate": int(best_candidate.item() if hasattr(best_candidate, "item") else best_candidate),
+                "confidence_margin": verify_margin,
+                "confidence_min_margin": verify_min_margin,
+            },
+            "controller_after_step": {
+                "draft_kv_retain_ratio": float(getattr(model, "draft_kv_retain_ratio", statistics.get("draft_kv_retain_ratio", 1.0))),
+                "attn_skip_layers": next_attn_skip_layers,
+                "mlp_skip_layers": next_mlp_skip_layers,
+                "attn_skip_count": int(len(next_attn_skip_layers)),
+                "mlp_skip_count": int(len(next_mlp_skip_layers)),
+                "verify_scope_beta1": int(statistics.get("verify_kv_scope_beta1", 0) or 0),
+                "verify_scope_beta2": int(statistics.get("verify_kv_scope_beta2", 0) or 0),
+                "verify_dynamic_last_action": statistics.get("verify_kv_dynamic_last_action"),
+            },
+            "should_stop": bool(should_stop),
+        })
 
         if should_stop:
             break
@@ -2295,11 +2902,20 @@ def swift_forward(input_ids, model, tokenizer, max_new_tokens, statistics=None, 
             draft_token_num=fixed_draft_token_num,
             statistics=statistics,
         )
-    logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
+        pending_draft_trace = _capture_draft_trace(model, statistics, input_ids, top1_prob)
+    if draft_token_num > 0:
+        logging.info("token acceptance rate: {}".format(total_acc_num / draft_token_num))
+    else:
+        logging.info("token acceptance rate: 0.0")
     _finish_local_adaptive_sample(statistics, local_adaptive_state, total_acc_num, draft_token_num)
-    return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num
-
-
+    _record_flops_sample_summary(
+        statistics,
+        input_len=input_len,
+        new_token_num=new_token_num,
+        step_count=idx + 1,
+        accept_length_list=accept_length_list,
+        draft_token_num=draft_token_num,
+    )
     return input_ids, new_token_num, idx + 1, accept_length_list, draft_token_num
 
 
@@ -2551,6 +3167,134 @@ if __name__ == "__main__":
         type=float,
         default=0.7,
         help="EMA weight for previous reused draft attention scores. Used only when --draft-kv-score-source reuse.",
+    )
+    parser.add_argument(
+        "--verify-kv-compress",
+        action="store_true",
+        default=False,
+        help="Approximate mode: also compress KV during tree verification. This does not preserve exact target-model verification.",
+    )
+    parser.add_argument(
+        "--verify-kv-retain-ratio",
+        type=float,
+        default=None,
+        help="Retain ratio for approximate verification KV. Defaults to the current adaptive draft retain ratio.",
+    )
+    parser.add_argument(
+        "--verify-kv-cache-mode",
+        type=str,
+        default="copy",
+        choices=["copy", "mask"],
+        help="Approximate verification KV implementation: compact copy or full-layout mask.",
+    )
+    parser.add_argument(
+        "--verify-kv-score-source",
+        type=str,
+        default="semantic",
+        choices=["heuristic", "observation", "reuse", "semantic", "scope"],
+        help="Token-importance source for approximate verification KV compression. scope preserves prefill KV and compresses only decoding KV using verifier attention.",
+    )
+    parser.add_argument(
+        "--verify-kv-bootstrap-full-steps",
+        type=int,
+        default=0,
+        help="Use full verifier KV for the first N tree-verification steps of each sample, while still collecting verifier semantic attention for later compressed steps.",
+    )
+    parser.add_argument(
+        "--verify-kv-scope-recent-size",
+        type=int,
+        default=None,
+        help="Deprecated alias for --verify-kv-scope-beta2.",
+    )
+    parser.add_argument(
+        "--verify-kv-scope-beta1",
+        type=int,
+        default=128,
+        help="SCOPE beta1: decoding middle heavy-hitter budget for VERIFY_KV_SCORE_SOURCE=scope.",
+    )
+    parser.add_argument(
+        "--verify-kv-scope-beta2",
+        type=int,
+        default=256,
+        help="SCOPE beta2: recent decoding-token window retained by VERIFY_KV_SCORE_SOURCE=scope.",
+    )
+    parser.add_argument(
+        "--verify-kv-safe-commit",
+        action="store_true",
+        default=False,
+        help="After approximate verification, recompute accepted-token KV with full-context verifier before committing it to the main cache.",
+    )
+    parser.add_argument(
+        "--verify-kv-dynamic",
+        action="store_true",
+        default=False,
+        help="Dynamically adjust SCOPE verifier beta1 using acceptance quality and verifier confidence. Requires --verify-kv-score-source scope.",
+    )
+    parser.add_argument(
+        "--verify-kv-dynamic-min-beta1",
+        type=int,
+        default=64,
+        help="Smallest SCOPE beta1 allowed by --verify-kv-dynamic.",
+    )
+    parser.add_argument(
+        "--verify-kv-dynamic-max-beta1",
+        type=int,
+        default=None,
+        help="Largest SCOPE beta1 allowed by --verify-kv-dynamic. Defaults to the initial --verify-kv-scope-beta1.",
+    )
+    parser.add_argument(
+        "--verify-kv-dynamic-step",
+        type=int,
+        default=32,
+        help="Step size for changing SCOPE beta1 when --verify-kv-dynamic switches.",
+    )
+    parser.add_argument(
+        "--verify-kv-dynamic-window",
+        type=int,
+        default=32,
+        help="Rolling SWIFT-step window used by --verify-kv-dynamic.",
+    )
+    parser.add_argument(
+        "--verify-kv-dynamic-min-observations",
+        type=int,
+        default=32,
+        help="Minimum SWIFT steps before --verify-kv-dynamic may switch beta1.",
+    )
+    parser.add_argument(
+        "--verify-kv-dynamic-acceptance-floor",
+        type=float,
+        default=0.88,
+        help="Minimum rolling draft-token acceptance rate for more aggressive verifier KV compression.",
+    )
+    parser.add_argument(
+        "--verify-kv-dynamic-mean-floor",
+        type=float,
+        default=3.0,
+        help="Minimum rolling mean accepted tokens for more aggressive verifier KV compression.",
+    )
+    parser.add_argument(
+        "--verify-kv-dynamic-confidence-floor",
+        type=float,
+        default=0.5,
+        help="Minimum rolling verifier top1-top2 margin for more aggressive verifier KV compression.",
+    )
+    parser.add_argument(
+        "--verify-kv-dynamic-confidence-low",
+        type=float,
+        default=0.25,
+        help="Rolling verifier margin below this value triggers less aggressive verifier KV compression.",
+    )
+    parser.add_argument(
+        "--verify-kv-dynamic-patience",
+        type=int,
+        default=2,
+        help="Consecutive good/bad rolling windows required before --verify-kv-dynamic changes beta1.",
+    )
+    parser.add_argument(
+        "--verify-kv-dynamic-cooldown",
+        type=int,
+        default=16,
+        help="SWIFT steps to wait after a verifier beta1 switch.",
     )
     parser.add_argument(
         "--dynamic-retain-ratio",
@@ -3110,6 +3854,18 @@ if __name__ == "__main__":
         help="Log drafted/accepted tokens for every SWIFT step. Disabled by default because it adds decode and file I/O overhead.",
     )
     parser.add_argument(
+        "--flops-trace",
+        action="store_true",
+        default=False,
+        help="Write a JSONL trace with per-step KV lengths, layer skips, acceptance, and estimated FLOPs inputs.",
+    )
+    parser.add_argument(
+        "--flops-trace-file",
+        type=str,
+        default=None,
+        help="Output JSONL path for --flops-trace. Defaults to the answer file with .flops_trace.jsonl suffix.",
+    )
+    parser.add_argument(
         "--draft-only",
         action="store_true",
         default=False,
@@ -3219,6 +3975,56 @@ if __name__ == "__main__":
         parser.error("--draft-kv-retain-ratio must be in the range (0, 1].")
     if args.draft_kv_reuse_ema < 0.0 or args.draft_kv_reuse_ema > 1.0:
         parser.error("--draft-kv-reuse-ema must be in the range [0, 1].")
+    if args.verify_kv_retain_ratio is not None and (
+            args.verify_kv_retain_ratio <= 0.0 or args.verify_kv_retain_ratio > 1.0):
+        parser.error("--verify-kv-retain-ratio must be in the range (0, 1].")
+    if args.verify_kv_bootstrap_full_steps < 0:
+        parser.error("--verify-kv-bootstrap-full-steps must be non-negative.")
+    if args.verify_kv_scope_recent_size is not None and args.verify_kv_scope_recent_size < 0:
+        parser.error("--verify-kv-scope-recent-size must be non-negative.")
+    if args.verify_kv_scope_beta1 < 0:
+        parser.error("--verify-kv-scope-beta1 must be non-negative.")
+    if args.verify_kv_scope_beta2 < 0:
+        parser.error("--verify-kv-scope-beta2 must be non-negative.")
+    if args.verify_kv_scope_recent_size is not None:
+        args.verify_kv_scope_beta2 = args.verify_kv_scope_recent_size
+    if args.verify_kv_dynamic:
+        if not args.verify_kv_compress:
+            parser.error("--verify-kv-dynamic requires --verify-kv-compress.")
+        if args.verify_kv_score_source != "scope":
+            parser.error("--verify-kv-dynamic requires --verify-kv-score-source scope.")
+        if args.verify_kv_dynamic_max_beta1 is None:
+            args.verify_kv_dynamic_max_beta1 = args.verify_kv_scope_beta1
+        if args.verify_kv_dynamic_min_beta1 < 0:
+            parser.error("--verify-kv-dynamic-min-beta1 must be non-negative.")
+        if args.verify_kv_dynamic_max_beta1 < args.verify_kv_dynamic_min_beta1:
+            parser.error("--verify-kv-dynamic-max-beta1 must be >= --verify-kv-dynamic-min-beta1.")
+        for name, value in [
+            ("--verify-kv-dynamic-step", args.verify_kv_dynamic_step),
+            ("--verify-kv-dynamic-window", args.verify_kv_dynamic_window),
+            ("--verify-kv-dynamic-min-observations", args.verify_kv_dynamic_min_observations),
+            ("--verify-kv-dynamic-patience", args.verify_kv_dynamic_patience),
+        ]:
+            if value <= 0:
+                parser.error(f"{name} must be a positive integer.")
+        if args.verify_kv_dynamic_cooldown < 0:
+            parser.error("--verify-kv-dynamic-cooldown must be non-negative.")
+        for name, value in [
+            ("--verify-kv-dynamic-acceptance-floor", args.verify_kv_dynamic_acceptance_floor),
+        ]:
+            if value < 0.0 or value > 1.0:
+                parser.error(f"{name} must be in the range [0, 1].")
+        for name, value in [
+            ("--verify-kv-dynamic-mean-floor", args.verify_kv_dynamic_mean_floor),
+            ("--verify-kv-dynamic-confidence-floor", args.verify_kv_dynamic_confidence_floor),
+            ("--verify-kv-dynamic-confidence-low", args.verify_kv_dynamic_confidence_low),
+        ]:
+            if value < 0.0:
+                parser.error(f"{name} must be non-negative.")
+        if args.verify_kv_dynamic_confidence_low > args.verify_kv_dynamic_confidence_floor:
+            parser.error("--verify-kv-dynamic-confidence-low must be <= --verify-kv-dynamic-confidence-floor.")
+    elif args.verify_kv_dynamic_max_beta1 is None:
+        args.verify_kv_dynamic_max_beta1 = args.verify_kv_scope_beta1
     if args.retain_warmup_rounds <= 0:
         parser.error("--retain-warmup-rounds must be a positive integer.")
     if args.retain_filter_top_k <= 0:
@@ -3509,16 +4315,38 @@ if __name__ == "__main__":
 
     retain_ratio_name = retain_ratio_run_name(args)
     cosine_name_suffix = ""
-    kv_cache_name_suffix = "-kvmask" if args.draft_kv_compress and args.draft_kv_cache_mode == "mask" else ""
     kv_score_name_suffix = "-kvsrc-" + args.draft_kv_score_source if args.draft_kv_compress else ""
+    verify_kv_name_suffix = ""
+    if args.verify_kv_compress:
+        verify_score_tags = {
+            "semantic": "sem",
+            "scope": "s",
+            "observation": "obs",
+            "heuristic": "heu",
+            "reuse": "reuse",
+        }
+        verify_kv_name_suffix = "-v" + verify_score_tags.get(
+            args.verify_kv_score_source,
+            args.verify_kv_score_source,
+        )
+        if args.verify_kv_score_source == "scope":
+            verify_kv_name_suffix += str(args.verify_kv_scope_beta1) + "x" + str(args.verify_kv_scope_beta2)
+            if args.verify_kv_dynamic:
+                verify_kv_name_suffix += "-d" + str(args.verify_kv_dynamic_min_beta1)
+        elif args.verify_kv_retain_ratio is not None:
+            verify_kv_name_suffix += "-r" + str(args.verify_kv_retain_ratio)
+        if args.verify_kv_bootstrap_full_steps > 0:
+            verify_kv_name_suffix += "-b" + str(args.verify_kv_bootstrap_full_steps)
+        if args.verify_kv_safe_commit:
+            verify_kv_name_suffix += "-sc"
     args.model_name = (args.model_id + "-swift-" + str(args.dtype)+ "-temp-" + str(args.temperature)
                        + "-top-p-" + str(args.top_p) + "-seed-" + str(args.seed) + "-max_new_tokens-" + str(args.max_new_tokens)+ "-opt_interval-" + str(args.opt_interval)
                     #    + "-bayes_interval-" + str(args.bayes_interval) + "-max_opt-" + str(args.max_opt_iter) + "-max_tolerance-" + str(args.max_tolerance_iter)
                        + "-max_score-" + str(args.max_score) + "-context_window-" + str(args.context_window) + "-skip_ratio-" + str(args.skip_ratio) + "-draft_kv_retain_ratio-" + retain_ratio_name
                        + "-opt_compressed_draft_kv-" + str(args.optimize_with_compressed_draft_kv)
                        + cosine_name_suffix
-                       + kv_cache_name_suffix
                        + kv_score_name_suffix
+                       + verify_kv_name_suffix
                        + ("-draft_token_num-" + str(args.draft_token_num) if args.draft_token_num is not None else "")
                        + ("-draft_only" if args.draft_only else ""))
     answer_file = args.answer_file or f"outputs/{args.task_name}/{args.task_name}_{args.data_num}/without_layerskip_draft_model_answer/{args.model_id}/{args.model_name}.jsonl"
@@ -3591,9 +4419,36 @@ if __name__ == "__main__":
                   "draft_kv_cache_mode": args.draft_kv_cache_mode,
                   "draft_kv_score_source": args.draft_kv_score_source,
                   "draft_kv_reuse_ema": args.draft_kv_reuse_ema,
+                  "verify_kv_compress": args.verify_kv_compress,
+                  "verify_kv_retain_ratio": args.verify_kv_retain_ratio,
+                  "verify_kv_cache_mode": args.verify_kv_cache_mode,
+                  "verify_kv_score_source": args.verify_kv_score_source,
+                  "verify_kv_bootstrap_full_steps": args.verify_kv_bootstrap_full_steps,
+                  "verify_kv_scope_recent_size": args.verify_kv_scope_beta2,
+                  "verify_kv_scope_beta1": args.verify_kv_scope_beta1,
+                  "verify_kv_scope_beta2": args.verify_kv_scope_beta2,
+                  "verify_kv_scope_score_full_only": True,
+                  "verify_kv_safe_commit": args.verify_kv_safe_commit,
+                  "verify_kv_dynamic": args.verify_kv_dynamic,
+                  "verify_kv_dynamic_initial_beta1": args.verify_kv_scope_beta1,
+                  "verify_kv_dynamic_current_beta1": args.verify_kv_scope_beta1,
+                  "verify_kv_dynamic_min_beta1": args.verify_kv_dynamic_min_beta1,
+                  "verify_kv_dynamic_max_beta1": args.verify_kv_dynamic_max_beta1,
+                  "verify_kv_dynamic_step": args.verify_kv_dynamic_step,
+                  "verify_kv_dynamic_window": args.verify_kv_dynamic_window,
+                  "verify_kv_dynamic_min_observations": args.verify_kv_dynamic_min_observations,
+                  "verify_kv_dynamic_acceptance_floor": args.verify_kv_dynamic_acceptance_floor,
+                  "verify_kv_dynamic_mean_floor": args.verify_kv_dynamic_mean_floor,
+                  "verify_kv_dynamic_confidence_floor": args.verify_kv_dynamic_confidence_floor,
+                  "verify_kv_dynamic_confidence_low": args.verify_kv_dynamic_confidence_low,
+                  "verify_kv_dynamic_patience": args.verify_kv_dynamic_patience,
+                  "verify_kv_dynamic_cooldown": args.verify_kv_dynamic_cooldown,
                   "optimize_with_compressed_draft_kv": args.optimize_with_compressed_draft_kv,
                   "draft_token_num": args.draft_token_num,
                   "log_draft_tokens": args.log_draft_tokens,
+                  "flops_trace_enabled": args.flops_trace,
+                  "flops_trace_file": args.flops_trace_file,
+                  "flops_trace_phase": "eval",
                   "cosine_prefill_skip_layers": args.cosine_prefill_skip_layers,
                   "cosine_skip_mode": args.cosine_skip_mode,
                   "cosine_attn_alpha": args.cosine_attn_alpha,
@@ -3694,6 +4549,10 @@ if __name__ == "__main__":
                   "adaptive_std_floor": args.adaptive_std_floor,
                   "adaptive_patience": args.adaptive_patience,
                   "adaptive_cooldown": args.adaptive_cooldown}
+
+    _initialize_flops_trace_file(statistics, model, args, answer_file)
+    if statistics.get("flops_trace_enabled", False):
+        print(f"FLOPs trace to {statistics.get('flops_trace_file')}")
 
     # Run dynamic-6 warmup once before the benchmark stream, never per question.
     run_adaptive_cold_start(model, tokenizer, statistics, logits_processor=logits_processor)

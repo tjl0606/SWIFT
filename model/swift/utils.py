@@ -13,6 +13,9 @@ SMART_KV_SINK_LEN = 4
 SMART_KV_OBSERVATION_WINDOW = 32
 SMART_KV_RECENT_FRACTION = 0.5
 SMART_KV_POOL_KERNEL = 7
+VERIFY_SCOPE_BETA1 = 128
+VERIFY_SCOPE_BETA2 = 256
+VERIFY_SCOPE_RECENT_SIZE = VERIFY_SCOPE_BETA2
 
 from transformers.generation.logits_process import (
     LogitsProcessorList,
@@ -380,6 +383,7 @@ def swift_verify(
         input_ids=None,
         past_key_values=None,
         position_ids=None,
+        attention_mask=None,
 ):
     """
     Verify the swift structure using the provided model and input.
@@ -387,7 +391,7 @@ def swift_verify(
     with torch.inference_mode():
         outputs = model.model(
             input_ids=input_ids,
-            attention_mask=None,
+            attention_mask=attention_mask,
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
@@ -549,6 +553,7 @@ def _select_smart_kv_indices(
         scores=None,
         sink_len=SMART_KV_SINK_LEN,
         recent_fraction=SMART_KV_RECENT_FRACTION,
+        positive_score_fallback=False,
 ):
     """
     Select a fixed-size KV budget using sink + recent + attention-heavy tokens.
@@ -579,8 +584,18 @@ def _select_smart_kv_indices(
             # The adaptive controller chooses the KV budget; attention scores
             # only rank which middle tokens should fill that budget.
             candidate_scores = scores.to(device=device)[candidate_indices]
-            topk = min(remaining, candidate_indices.numel())
-            selected = candidate_indices[torch.topk(candidate_scores, k=topk).indices]
+            if positive_score_fallback:
+                positive_mask = candidate_scores > 0
+                scored_indices = candidate_indices[positive_mask]
+                scored_scores = candidate_scores[positive_mask]
+            else:
+                scored_indices = candidate_indices
+                scored_scores = candidate_scores
+            if scored_indices.numel() > 0:
+                topk = min(remaining, scored_indices.numel())
+                selected = scored_indices[torch.topk(scored_scores, k=topk).indices]
+            else:
+                selected = candidate_indices.new_empty(0)
         else:
             # No attention statistics are available on the first decode step,
             # so use a deterministic spread through the non-sink/non-recent span.
@@ -590,9 +605,107 @@ def _select_smart_kv_indices(
     remaining = keep_len - int(keep_mask.sum().item())
     if remaining > 0:
         candidate_indices = torch.nonzero(~keep_mask, as_tuple=True)[0]
-        keep_mask[candidate_indices[-remaining:]] = True
+        selected = _fill_indices_evenly(candidate_indices, remaining)
+        keep_mask[selected] = True
 
     return torch.nonzero(keep_mask, as_tuple=True)[0]
+
+
+def _select_scope_verify_kv_indices(
+        full_input_ids,
+        prefill_len,
+        scores=None,
+        beta1=VERIFY_SCOPE_BETA1,
+        beta2=VERIFY_SCOPE_BETA2,
+        min_retain_tokens=16,
+        statistics=None,
+):
+    """
+    SCOPE-style verifier selection: keep the prefill/prompt KV fixed, and only
+    compress KV generated during decoding with a beta1 + beta2 budget.
+    """
+    full_len = int(full_input_ids.shape[1])
+    device = full_input_ids.device
+    prefill_len = max(0, min(int(prefill_len), full_len))
+    beta1 = max(0, int(beta1))
+    beta2 = max(0, int(beta2))
+    decode_len = full_len - prefill_len
+    if decode_len <= 0:
+        return torch.arange(full_len, device=device, dtype=torch.long), full_len, full_len
+
+    decode_budget = min(decode_len, beta1 + beta2)
+    if decode_len <= decode_budget:
+        # Below the SCOPE budget there is no approximate verifier cache: the
+        # verifier sees the full decoding history and remains exact.
+        if statistics is not None:
+            _increment_stat(statistics, "verify_kv_scope_full_decode_uses")
+            statistics["verify_kv_scope_beta1"] = int(beta1)
+            statistics["verify_kv_scope_beta2"] = int(beta2)
+        return torch.arange(full_len, device=device, dtype=torch.long), full_len, full_len
+
+    decode_keep_len = decode_budget
+    keep_len = prefill_len + decode_keep_len
+
+    keep_mask = torch.zeros(full_len, device=device, dtype=torch.bool)
+    if prefill_len > 0:
+        # SCOPE does not rank or evict prompt/prefill KV.
+        keep_mask[:prefill_len] = True
+
+    recent_count = min(beta2, decode_keep_len, decode_len)
+    if recent_count > 0:
+        # beta2 is a hard local decoding window.
+        keep_mask[full_len - recent_count:] = True
+
+    remaining = keep_len - int(keep_mask.sum().item())
+    decode_middle_end = full_len - recent_count
+    if remaining > 0 and decode_middle_end > prefill_len:
+        # beta1 is spent only on the decoding middle, ranked by full-context
+        # verifier attention statistics when available.
+        candidate_indices = torch.arange(
+            prefill_len,
+            decode_middle_end,
+            device=device,
+            dtype=torch.long,
+        )
+        selected = candidate_indices.new_empty(0)
+        if scores is not None and scores.numel() == full_len:
+            candidate_scores = scores.to(device=device, dtype=torch.float32)[candidate_indices]
+            positive_mask = candidate_scores > 0
+            scored_indices = candidate_indices[positive_mask]
+            scored_scores = candidate_scores[positive_mask]
+            if scored_indices.numel() > 0:
+                topk = min(remaining, scored_indices.numel())
+                selected = scored_indices[torch.topk(scored_scores, k=topk).indices]
+        if selected.numel() > 0:
+            keep_mask[selected] = True
+
+    remaining = keep_len - int(keep_mask.sum().item())
+    if remaining > 0:
+        # First steps may not have verifier attention scores yet; even
+        # sampling keeps coverage deterministic without task-specific rules.
+        candidate_indices = torch.nonzero(~keep_mask, as_tuple=True)[0]
+        candidate_indices = candidate_indices[candidate_indices >= prefill_len]
+        selected = _fill_indices_evenly(candidate_indices, remaining)
+        keep_mask[selected] = True
+
+    if statistics is not None:
+        _increment_stat(statistics, "verify_kv_scope_selection_count")
+        statistics["verify_kv_scope_beta1"] = int(beta1)
+        statistics["verify_kv_scope_beta2"] = int(beta2)
+        statistics["verify_kv_scope_recent_size"] = int(beta2)
+        statistics["verify_kv_scope_prefill_len"] = int(prefill_len)
+        statistics["verify_kv_scope_prefill_kept_sum"] = (
+            int(statistics.get("verify_kv_scope_prefill_kept_sum", 0)) + int(prefill_len)
+        )
+        statistics["verify_kv_scope_decode_len_sum"] = (
+            int(statistics.get("verify_kv_scope_decode_len_sum", 0)) + int(decode_len)
+        )
+        statistics["verify_kv_scope_decode_kept_sum"] = (
+            int(statistics.get("verify_kv_scope_decode_kept_sum", 0)) + int(decode_keep_len)
+        )
+
+    keep_indices = torch.nonzero(keep_mask, as_tuple=True)[0]
+    return keep_indices, full_len, int(keep_indices.numel())
 
 
 def _copy_selected_kv_cache(model, past_key_values_data, current_length_data, keep_indices):
@@ -712,7 +825,13 @@ def swift_draft(
         max_step_draft = min(max_step_draft, draft_token_num)
 
     collect_draft_scores = (
-        _draft_kv_score_source(statistics) == "reuse"
+        (
+            _draft_kv_score_source(statistics) == "reuse"
+            or (
+                _verify_kv_enabled(statistics)
+                and _verify_kv_score_source(statistics) == "reuse"
+            )
+        )
         and getattr(model, "draft_kv_last_keep_indices", None) is not None
     )
     if collect_draft_scores:
@@ -813,6 +932,270 @@ def _draft_kv_cache_mode(statistics):
     return statistics.get("draft_kv_cache_mode", "copy")
 
 
+def _verify_kv_enabled(statistics):
+    return bool(statistics and statistics.get("verify_kv_compress", False))
+
+
+def _verify_kv_cache_mode(statistics):
+    if statistics is None:
+        return "copy"
+    return statistics.get("verify_kv_cache_mode", "copy")
+
+
+def _verify_kv_score_source(statistics):
+    if statistics is None:
+        return "semantic"
+    return statistics.get("verify_kv_score_source", "semantic")
+
+
+def _verify_kv_retain_ratio(statistics):
+    if statistics is None:
+        return 1.0
+    ratio = statistics.get("verify_kv_retain_ratio")
+    if ratio is None:
+        ratio = statistics.get("draft_kv_retain_ratio", 1.0)
+    return float(ratio)
+
+
+def _verify_kv_bootstrap_full_steps(statistics):
+    if statistics is None:
+        return 0
+    return max(0, int(statistics.get("verify_kv_bootstrap_full_steps", 0) or 0))
+
+
+def _verify_kv_prefill_len(statistics, full_len):
+    if statistics is None:
+        return int(full_len)
+    prefill_len = int(statistics.get("verify_kv_prefill_len", full_len) or 0)
+    return max(0, min(prefill_len, int(full_len)))
+
+
+def _verify_kv_scope_beta1(statistics):
+    if statistics is None:
+        return VERIFY_SCOPE_BETA1
+    return max(0, int(statistics.get("verify_kv_scope_beta1", VERIFY_SCOPE_BETA1) or 0))
+
+
+def _verify_kv_scope_beta2(statistics):
+    if statistics is None:
+        return VERIFY_SCOPE_BETA2
+    legacy_recent_size = int(
+        statistics.get("verify_kv_scope_recent_size", VERIFY_SCOPE_BETA2) or VERIFY_SCOPE_BETA2
+    )
+    return max(0, int(statistics.get("verify_kv_scope_beta2", legacy_recent_size) or 0))
+
+
+def _verify_kv_scope_recent_size(statistics):
+    return _verify_kv_scope_beta2(statistics)
+
+
+def _verify_kv_scope_score_full_only(statistics):
+    if statistics is None:
+        return True
+    return bool(statistics.get("verify_kv_scope_score_full_only", True))
+
+
+def _verify_kv_dynamic_enabled(statistics):
+    return bool(
+        statistics
+        and statistics.get("verify_kv_dynamic", False)
+        and statistics.get("verify_kv_compress", False)
+        and statistics.get("verify_kv_score_source") == "scope"
+    )
+
+
+def _verify_kv_scope_needs_compression(full_input_ids, statistics):
+    if full_input_ids is None:
+        return False
+    full_len = int(full_input_ids.shape[1])
+    prefill_len = _verify_kv_prefill_len(statistics, full_len)
+    decode_len = max(0, full_len - prefill_len)
+    beta1 = _verify_kv_scope_beta1(statistics)
+    beta2 = _verify_kv_scope_beta2(statistics)
+    if statistics is not None:
+        statistics["verify_kv_scope_beta1"] = int(beta1)
+        statistics["verify_kv_scope_beta2"] = int(beta2)
+        statistics["verify_kv_scope_recent_size"] = int(beta2)
+        statistics["verify_kv_scope_prefill_len"] = int(prefill_len)
+    # Until generated decoding KV exceeds beta1+beta2, the SCOPE verifier path
+    # should fall through to full-cache verification.
+    return decode_len > (beta1 + beta2)
+
+
+def verify_confidence_margin(logits, best_candidate, accept_length):
+    if logits is None or logits.numel() == 0 or logits.shape[-1] < 2:
+        return None, None
+
+    candidate_index = int(best_candidate.item() if hasattr(best_candidate, "item") else best_candidate)
+    candidate_index = max(0, min(candidate_index, int(logits.shape[0]) - 1))
+    step_count = max(1, min(int(accept_length) + 1, int(logits.shape[1])))
+    selected_logits = logits[candidate_index, :step_count].detach().float()
+    top2 = torch.topk(selected_logits, k=2, dim=-1).values
+    margins = top2[:, 0] - top2[:, 1]
+    return float(margins.mean().cpu().item()), float(margins.min().cpu().item())
+
+
+def update_verify_kv_dynamic_controller(
+        statistics,
+        accepted_total_tokens,
+        accepted_draft_tokens,
+        drafted_tokens,
+        confidence_margin,
+        confidence_min=None,
+        allow_switch=True,
+):
+    if not _verify_kv_dynamic_enabled(statistics) or drafted_tokens <= 0:
+        return
+
+    accepted_total_tokens = int(accepted_total_tokens)
+    accepted_draft_tokens = max(0, int(accepted_draft_tokens))
+    drafted_tokens = max(1, int(drafted_tokens))
+    confidence_margin = 0.0 if confidence_margin is None else float(confidence_margin)
+    confidence_min = confidence_margin if confidence_min is None else float(confidence_min)
+    # Dynamic verifier compression uses accepted draft tokens and verifier
+    # confidence as quality signals; it does not inspect task labels.
+    token_acceptance = float(accepted_draft_tokens) / float(drafted_tokens)
+
+    acceptance_history = statistics.setdefault("verify_kv_dynamic_acceptance_history", [])
+    mean_history = statistics.setdefault("verify_kv_dynamic_mean_history", [])
+    margin_history = statistics.setdefault("verify_kv_dynamic_margin_history", [])
+    min_margin_history = statistics.setdefault("verify_kv_dynamic_min_margin_history", [])
+    acceptance_history.append(token_acceptance)
+    mean_history.append(float(accepted_total_tokens))
+    margin_history.append(confidence_margin)
+    min_margin_history.append(confidence_min)
+
+    statistics["verify_kv_dynamic_observations"] = len(acceptance_history)
+    statistics["verify_kv_dynamic_acceptance_sum"] = (
+        float(statistics.get("verify_kv_dynamic_acceptance_sum", 0.0)) + token_acceptance
+    )
+    statistics["verify_kv_dynamic_mean_sum"] = (
+        float(statistics.get("verify_kv_dynamic_mean_sum", 0.0)) + float(accepted_total_tokens)
+    )
+    statistics["verify_kv_dynamic_confidence_margin_sum"] = (
+        float(statistics.get("verify_kv_dynamic_confidence_margin_sum", 0.0)) + confidence_margin
+    )
+    statistics["verify_kv_dynamic_confidence_min_sum"] = (
+        float(statistics.get("verify_kv_dynamic_confidence_min_sum", 0.0)) + confidence_min
+    )
+
+    window = max(1, int(statistics.get("verify_kv_dynamic_window", 32) or 32))
+    min_observations = max(1, int(statistics.get("verify_kv_dynamic_min_observations", window) or window))
+    if len(acceptance_history) < min_observations:
+        return
+
+    recent_acceptance = acceptance_history[-window:]
+    recent_mean = mean_history[-window:]
+    recent_margin = margin_history[-window:]
+    recent_min_margin = min_margin_history[-window:]
+    window_acceptance = sum(recent_acceptance) / float(len(recent_acceptance))
+    window_mean = sum(recent_mean) / float(len(recent_mean))
+    window_margin = sum(recent_margin) / float(len(recent_margin))
+    window_min_margin = sum(recent_min_margin) / float(len(recent_min_margin))
+
+    statistics["verify_kv_dynamic_last_window_acceptance"] = float(window_acceptance)
+    statistics["verify_kv_dynamic_last_window_mean"] = float(window_mean)
+    statistics["verify_kv_dynamic_last_window_margin"] = float(window_margin)
+    statistics["verify_kv_dynamic_last_window_min_margin"] = float(window_min_margin)
+
+    cooldown_remaining = int(statistics.get("verify_kv_dynamic_cooldown_remaining", 0) or 0)
+    if cooldown_remaining > 0:
+        statistics["verify_kv_dynamic_cooldown_remaining"] = cooldown_remaining - 1
+        return
+    if not allow_switch:
+        return
+
+    beta1 = _verify_kv_scope_beta1(statistics)
+    min_beta1 = max(0, int(statistics.get("verify_kv_dynamic_min_beta1", 64) or 0))
+    max_beta1 = int(statistics.get("verify_kv_dynamic_max_beta1", beta1) or beta1)
+    max_beta1 = max(min_beta1, max_beta1)
+    step = max(1, int(statistics.get("verify_kv_dynamic_step", 32) or 32))
+    patience = max(1, int(statistics.get("verify_kv_dynamic_patience", 2) or 2))
+    cooldown = max(0, int(statistics.get("verify_kv_dynamic_cooldown", 16) or 0))
+
+    acceptance_floor = float(statistics.get("verify_kv_dynamic_acceptance_floor", 0.88))
+    mean_floor = float(statistics.get("verify_kv_dynamic_mean_floor", 3.0))
+    confidence_floor = float(statistics.get("verify_kv_dynamic_confidence_floor", 0.5))
+    confidence_low = float(statistics.get("verify_kv_dynamic_confidence_low", 0.25))
+
+    low_quality = (
+        window_acceptance < acceptance_floor
+        or window_mean < mean_floor
+        or window_margin < confidence_low
+    )
+    high_quality = (
+        window_acceptance >= acceptance_floor
+        and window_mean >= mean_floor
+        and window_margin >= confidence_floor
+    )
+
+    if low_quality:
+        statistics["verify_kv_dynamic_bad_windows"] = (
+            int(statistics.get("verify_kv_dynamic_bad_windows", 0)) + 1
+        )
+        statistics["verify_kv_dynamic_good_windows"] = 0
+    elif high_quality:
+        statistics["verify_kv_dynamic_good_windows"] = (
+            int(statistics.get("verify_kv_dynamic_good_windows", 0)) + 1
+        )
+        statistics["verify_kv_dynamic_bad_windows"] = 0
+    else:
+        statistics["verify_kv_dynamic_good_windows"] = 0
+        statistics["verify_kv_dynamic_bad_windows"] = 0
+
+    action = "keep"
+    new_beta1 = beta1
+    if low_quality and int(statistics.get("verify_kv_dynamic_bad_windows", 0)) >= patience:
+        # Poor windows make verification less approximate by increasing beta1.
+        new_beta1 = min(max_beta1, beta1 + step)
+        action = "less_compress" if new_beta1 != beta1 else "keep"
+        statistics["verify_kv_dynamic_bad_windows"] = 0
+    elif high_quality and int(statistics.get("verify_kv_dynamic_good_windows", 0)) >= patience:
+        # Stable high-quality windows trade verifier context for speed.
+        new_beta1 = max(min_beta1, beta1 - step)
+        action = "more_compress" if new_beta1 != beta1 else "keep"
+        statistics["verify_kv_dynamic_good_windows"] = 0
+
+    action_counts = statistics.setdefault("verify_kv_dynamic_action_counts", {})
+    action_counts[action] = int(action_counts.get(action, 0)) + 1
+    statistics["verify_kv_dynamic_decision_count"] = int(
+        statistics.get("verify_kv_dynamic_decision_count", 0)
+    ) + 1
+    statistics["verify_kv_dynamic_last_action"] = action
+
+    if new_beta1 == beta1:
+        statistics["verify_kv_dynamic_keep_decisions"] = int(
+            statistics.get("verify_kv_dynamic_keep_decisions", 0)
+        ) + 1
+        return
+
+    statistics["verify_kv_scope_beta1"] = int(new_beta1)
+    statistics["verify_kv_dynamic_current_beta1"] = int(new_beta1)
+    statistics["verify_kv_dynamic_cooldown_remaining"] = cooldown
+    statistics["verify_kv_dynamic_switches"] = int(
+        statistics.get("verify_kv_dynamic_switches", 0)
+    ) + 1
+    if new_beta1 < beta1:
+        statistics["verify_kv_dynamic_more_compress_switches"] = int(
+            statistics.get("verify_kv_dynamic_more_compress_switches", 0)
+        ) + 1
+    else:
+        statistics["verify_kv_dynamic_less_compress_switches"] = int(
+            statistics.get("verify_kv_dynamic_less_compress_switches", 0)
+        ) + 1
+    logging.info(
+        "Verify KV dynamic {}: beta1 {} -> {} "
+        "(acceptance {:.4f}, mean {:.4f}, margin {:.4f})".format(
+            action,
+            beta1,
+            new_beta1,
+            window_acceptance,
+            window_mean,
+            window_margin,
+        )
+    )
+
+
 def _increment_stat(statistics, key):
     if statistics is not None:
         statistics[key] = int(statistics.get(key, 0)) + 1
@@ -826,12 +1209,23 @@ def _clear_draft_reuse_mapping(model):
     model.draft_kv_mask_full_len = 0
 
 
+def _clear_verify_kv_mapping(model):
+    model.verify_kv_last_keep_indices = None
+    model.verify_kv_last_full_len = 0
+    model.verify_kv_last_cache_mode = None
+    model.verify_kv_mask_keep_indices = None
+    model.verify_kv_mask_full_len = 0
+
+
 def reset_draft_attention_reuse(model):
     model.draft_kv_reuse_scores = None
     model.draft_kv_reuse_scores_len = 0
+    model.verify_kv_semantic_scores = None
+    model.verify_kv_semantic_scores_len = 0
     model.draft_kv_pending_attention_scores = None
     model.draft_kv_pending_attention_scores_len = 0
     _clear_draft_reuse_mapping(model)
+    _clear_verify_kv_mapping(model)
     for layer in getattr(model.model, "layers", []):
         attn = getattr(layer, "self_attn", None)
         if attn is None:
@@ -839,6 +1233,9 @@ def reset_draft_attention_reuse(model):
         attn.collect_draft_attn_scores = False
         attn.draft_attn_score_sum = None
         attn.draft_attn_score_count = 0
+        attn.collect_verify_attn_scores = False
+        attn.verify_attn_score_sum = None
+        attn.verify_attn_score_count = 0
 
 
 def _set_draft_reuse_mapping(model, keep_indices, full_len, cache_mode="copy"):
@@ -847,21 +1244,80 @@ def _set_draft_reuse_mapping(model, keep_indices, full_len, cache_mode="copy"):
     model.draft_kv_last_cache_mode = cache_mode
 
 
-def _get_reused_draft_attention_scores(model, full_len, device, statistics=None):
+def _set_verify_kv_mapping(model, keep_indices, full_len, cache_mode="copy"):
+    model.verify_kv_last_keep_indices = keep_indices.detach()
+    model.verify_kv_last_full_len = int(full_len)
+    model.verify_kv_last_cache_mode = cache_mode
+
+
+def _get_reused_draft_attention_scores(model, full_len, device, statistics=None, stat_prefix="draft_kv"):
     scores = getattr(model, "draft_kv_reuse_scores", None)
+    miss_key = f"{stat_prefix}_reuse_score_misses"
+    hit_key = f"{stat_prefix}_reuse_score_hits"
     if scores is None or scores.numel() == 0:
-        _increment_stat(statistics, "draft_kv_reuse_score_misses")
+        _increment_stat(statistics, miss_key)
         return None
 
     reused_scores = torch.zeros(full_len, dtype=torch.float32, device=device)
     copy_len = min(int(full_len), int(scores.numel()))
     if copy_len <= 0:
-        _increment_stat(statistics, "draft_kv_reuse_score_misses")
+        _increment_stat(statistics, miss_key)
         return None
 
     reused_scores[:copy_len].copy_(scores.to(device=device, dtype=torch.float32)[:copy_len])
-    _increment_stat(statistics, "draft_kv_reuse_score_hits")
+    _increment_stat(statistics, hit_key)
     return reused_scores
+
+
+def _get_reused_semantic_attention_scores(model, full_len, device, statistics=None, stat_prefix="verify_kv"):
+    scores = getattr(model, "verify_kv_semantic_scores", None)
+    miss_key = f"{stat_prefix}_semantic_score_misses"
+    hit_key = f"{stat_prefix}_semantic_score_hits"
+    if scores is None or scores.numel() == 0:
+        _increment_stat(statistics, miss_key)
+        return None
+
+    reused_scores = torch.zeros(full_len, dtype=torch.float32, device=device)
+    copy_len = min(int(full_len), int(scores.numel()))
+    if copy_len <= 0:
+        _increment_stat(statistics, miss_key)
+        return None
+
+    reused_scores[:copy_len].copy_(scores.to(device=device, dtype=torch.float32)[:copy_len])
+    _increment_stat(statistics, hit_key)
+    return reused_scores
+
+
+def _update_verify_semantic_attention_scores(model, attention_scores, statistics=None):
+    if attention_scores is None or attention_scores.numel() == 0:
+        return False
+
+    current_scores = attention_scores.detach().float()
+    full_len = int(current_scores.numel())
+    if full_len <= 0:
+        return False
+
+    ema = 0.7
+    if statistics is not None:
+        ema = float(statistics.get("draft_kv_reuse_ema", ema))
+    ema = min(1.0, max(0.0, ema))
+
+    previous_scores = getattr(model, "verify_kv_semantic_scores", None)
+    if previous_scores is not None and previous_scores.numel() > 0:
+        merged_scores = current_scores.clone()
+        copy_len = min(int(previous_scores.numel()), full_len)
+        previous_slice = previous_scores.to(
+            device=current_scores.device,
+            dtype=torch.float32,
+        )[:copy_len]
+        merged_scores[:copy_len] = previous_slice * ema + current_scores[:copy_len] * (1.0 - ema)
+    else:
+        merged_scores = current_scores
+
+    model.verify_kv_semantic_scores = merged_scores.detach()
+    model.verify_kv_semantic_scores_len = full_len
+    _increment_stat(statistics, "verify_kv_semantic_score_updates")
+    return True
 
 
 def _start_draft_attention_collection(model):
@@ -920,6 +1376,59 @@ def _finish_draft_attention_collection(model, statistics=None):
 
     model.draft_kv_pending_attention_scores = full_scores.detach()
     model.draft_kv_pending_attention_scores_len = full_len
+
+
+def _start_verify_attention_collection(model):
+    for layer in getattr(model.model, "layers", []):
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            continue
+        attn.collect_verify_attn_scores = True
+        attn.verify_attn_score_sum = None
+        attn.verify_attn_score_count = 0
+
+
+def _finish_verify_attention_collection(model, full_len, statistics=None):
+    keep_indices = getattr(model, "verify_kv_last_keep_indices", None)
+    cache_mode = getattr(model, "verify_kv_last_cache_mode", "copy")
+    full_len = int(full_len)
+    if full_len <= 0:
+        return
+
+    compressed_len = int(keep_indices.numel()) if keep_indices is not None else full_len
+    layer_scores = []
+    for layer in getattr(model.model, "layers", []):
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            continue
+        attn.collect_verify_attn_scores = False
+        score_sum = getattr(attn, "verify_attn_score_sum", None)
+        score_count = int(getattr(attn, "verify_attn_score_count", 0) or 0)
+        if score_sum is not None and score_count > 0:
+            if cache_mode == "mask" or keep_indices is None:
+                usable_len = min(full_len, int(score_sum.numel()))
+            else:
+                usable_len = min(compressed_len, int(score_sum.numel()))
+            if usable_len > 0:
+                layer_scores.append(score_sum[:usable_len].detach().float() / float(score_count))
+        attn.verify_attn_score_sum = None
+        attn.verify_attn_score_count = 0
+
+    if not layer_scores:
+        return
+
+    usable_len = min(score.numel() for score in layer_scores)
+    device = layer_scores[0].device
+    collected_scores = torch.stack([score[:usable_len].to(device) for score in layer_scores]).mean(dim=0)
+    full_scores = torch.zeros(full_len, dtype=torch.float32, device=device)
+    if cache_mode == "mask" or keep_indices is None:
+        full_scores[:usable_len] = collected_scores[:usable_len]
+    else:
+        local_keep_indices = keep_indices.to(device=device)[:usable_len]
+        valid = local_keep_indices < full_len
+        full_scores[local_keep_indices[valid]] = collected_scores[valid]
+
+    _update_verify_semantic_attention_scores(model, full_scores, statistics=statistics)
 
 
 def apply_draft_attention_reuse_reward(
@@ -1147,6 +1656,81 @@ def _select_draft_kv_keep_indices(
     return keep_indices, full_len, keep_len
 
 
+def _select_verify_kv_keep_indices(
+        model,
+        full_input_ids,
+        past_key_values_data,
+        current_length_data,
+        retain_ratio=1.0,
+        min_retain_tokens=16,
+        statistics=None,
+):
+    if full_input_ids is None:
+        return None, 0, 0
+
+    full_len = full_input_ids.shape[1]
+    keep_len = max(min_retain_tokens, int(full_len * retain_ratio))
+    keep_len = min(keep_len, full_len)
+
+    if keep_len == full_len:
+        return torch.arange(full_len, device=full_input_ids.device, dtype=torch.long), full_len, keep_len
+
+    _clear_swift_tree_state(model)
+    score_source = _verify_kv_score_source(statistics)
+    if score_source == "observation":
+        scores = _get_observation_attention_scores(
+            model=model,
+            full_input_ids=full_input_ids,
+            past_key_values_data=past_key_values_data,
+            current_length_data=current_length_data,
+        )
+    elif score_source == "semantic":
+        scores = _get_reused_semantic_attention_scores(
+            model=model,
+            full_len=full_len,
+            device=full_input_ids.device,
+            statistics=statistics,
+            stat_prefix="verify_kv",
+        )
+    elif score_source == "scope":
+        # SCOPE uses verifier semantic scores, but score collection is limited
+        # to full-context verifier passes by default to avoid a masked-context
+        # feedback loop.
+        scores = _get_reused_semantic_attention_scores(
+            model=model,
+            full_len=full_len,
+            device=full_input_ids.device,
+            statistics=statistics,
+            stat_prefix="verify_kv",
+        )
+        return _select_scope_verify_kv_indices(
+            full_input_ids=full_input_ids,
+            prefill_len=_verify_kv_prefill_len(statistics, full_len),
+            scores=scores,
+            beta1=_verify_kv_scope_beta1(statistics),
+            beta2=_verify_kv_scope_beta2(statistics),
+            min_retain_tokens=min_retain_tokens,
+            statistics=statistics,
+        )
+    elif score_source == "reuse":
+        scores = _get_reused_draft_attention_scores(
+            model=model,
+            full_len=full_len,
+            device=full_input_ids.device,
+            statistics=statistics,
+            stat_prefix="verify_kv",
+        )
+    else:
+        scores = None
+    keep_indices = _select_smart_kv_indices(
+        full_input_ids=full_input_ids,
+        keep_len=keep_len,
+        scores=scores,
+        positive_score_fallback=(score_source == "semantic"),
+    )
+    return keep_indices, full_len, keep_len
+
+
 def prepare_masked_draft_cache(
         model,
         full_input_ids,
@@ -1188,6 +1772,100 @@ def prepare_masked_draft_cache(
     )
 
 
+def prepare_approx_verify_cache(
+        model,
+        full_input_ids,
+        past_key_values_data,
+        current_length_data,
+        retain_ratio=1.0,
+        min_retain_tokens=16,
+        statistics=None,
+):
+    """
+    Prepare the approximate verifier KV cache.
+
+    Copy mode uses a compact verifier cache and later copies accepted-token KV
+    back into the full cache.  Mask mode keeps the full cache layout and hides
+    unselected old tokens during tree verification.
+    """
+    keep_indices, full_len, keep_len = _select_verify_kv_keep_indices(
+        model=model,
+        full_input_ids=full_input_ids,
+        past_key_values_data=past_key_values_data,
+        current_length_data=current_length_data,
+        retain_ratio=retain_ratio,
+        min_retain_tokens=min_retain_tokens,
+        statistics=statistics,
+    )
+    if keep_indices is None or keep_len == full_len:
+        _clear_verify_kv_mapping(model)
+        return _share_past_key_values(model, past_key_values_data, current_length_data), None, False
+
+    cache_mode = _verify_kv_cache_mode(statistics)
+    _set_verify_kv_mapping(model, keep_indices, full_len, cache_mode=cache_mode)
+    if cache_mode == "mask":
+        model.verify_kv_mask_keep_indices = keep_indices.detach()
+        model.verify_kv_mask_full_len = int(full_len)
+        _increment_stat(statistics, "verify_kv_mask_cache_rebuilds")
+        return (
+            _share_past_key_values(
+                model,
+                past_key_values_data,
+                current_length_data,
+                current_length=full_len,
+            ),
+            None,
+            True,
+        )
+
+    _clear_verify_kv_mapping(model)
+    _set_verify_kv_mapping(model, keep_indices, full_len, cache_mode="copy")
+    _increment_stat(statistics, "verify_kv_copy_cache_rebuilds")
+    return (
+        _copy_selected_kv_cache(
+            model=model,
+            past_key_values_data=past_key_values_data,
+            current_length_data=current_length_data,
+            keep_indices=keep_indices,
+        ),
+        keep_len,
+        False,
+    )
+
+
+def _build_masked_verify_attention_mask(model, past_key_values, input_ids):
+    keep_indices = getattr(model, "verify_kv_mask_keep_indices", None)
+    full_len = int(getattr(model, "verify_kv_mask_full_len", 0) or 0)
+    if keep_indices is None or full_len <= 0 or input_ids is None:
+        return None
+
+    past_len = 0
+    if past_key_values is not None:
+        for past_key_value in past_key_values:
+            if past_key_value is not None:
+                past_len = int(past_key_value[0].shape[2])
+                break
+
+    total_len = past_len + int(input_ids.shape[1])
+    if total_len <= 0:
+        return None
+
+    attention_mask = torch.zeros(
+        (input_ids.shape[0], total_len),
+        dtype=torch.bool,
+        device=input_ids.device,
+    )
+    local_keep_indices = keep_indices.to(device=input_ids.device)
+    valid = (local_keep_indices >= 0) & (local_keep_indices < min(full_len, total_len))
+    if valid.any().item():
+        attention_mask[:, local_keep_indices[valid]] = True
+
+    if total_len > full_len:
+        attention_mask[:, full_len:] = True
+
+    return attention_mask
+
+
 def reset_past_key_values(past_key_values):
     """
     Resets the current lengths in the past key-values to zero.
@@ -1196,6 +1874,41 @@ def reset_past_key_values(past_key_values):
         for j in range(2):
             past_key_values[i][j].current_length.fill_(0)
     return past_key_values
+
+
+def recompute_accepted_kv_full_context(
+        model,
+        past_key_values_data,
+        current_length_data,
+        input_ids,
+        accepted_tokens,
+):
+    if accepted_tokens is None or accepted_tokens.numel() == 0:
+        return False
+
+    prev_input_len = int(input_ids.shape[1])
+    _clear_swift_tree_state(model)
+    full_current_length_data = current_length_data.clone()
+    full_current_length_data.fill_(prev_input_len)
+    full_past_key_values = clone_past_key_values(
+        model,
+        past_key_values_data,
+        full_current_length_data,
+    )
+    position_ids = torch.arange(
+        prev_input_len,
+        prev_input_len + int(accepted_tokens.shape[1]),
+        dtype=torch.long,
+        device=accepted_tokens.device,
+    ).unsqueeze(0)
+    with torch.inference_mode():
+        model.model(
+            input_ids=accepted_tokens,
+            attention_mask=None,
+            past_key_values=full_past_key_values,
+            position_ids=position_ids,
+        )
+    return True
 
 
 def generate_candidates(swift_logits, tree_indices, retrieve_indices, sample_token, logits_processor):
@@ -1244,22 +1957,118 @@ def tree_decoding(
         swift_position_ids,
         input_ids,
         retrieve_indices,
+        past_key_values_data=None,
+        current_length_data=None,
+        statistics=None,
 ):
     """
     Decode the tree candidates using the provided model and reorganize the logits.
     """
     position_ids = swift_position_ids + input_ids.shape[1]
-
-    outputs, tree_logits = swift_verify(
-        model,
-        tree_candidates,
-        past_key_values=past_key_values,
-        position_ids=position_ids,
+    verify_kv_source_data = None
+    verify_kv_source_base_offset = None
+    verify_attention_mask = None
+    verify_past_key_values = past_key_values
+    use_verify_kv_mask = False
+    used_approx_verify_kv = False
+    verify_sample_step = int(statistics.get("verify_kv_sample_step", 0) or 0) if statistics is not None else 0
+    use_bootstrap_full_kv = (
+        _verify_kv_enabled(statistics)
+        and verify_sample_step < _verify_kv_bootstrap_full_steps(statistics)
     )
+    verify_score_source = _verify_kv_score_source(statistics)
+    scope_needs_compression = (
+        verify_score_source == "scope"
+        and _verify_kv_scope_needs_compression(input_ids, statistics)
+    )
+
+    if (
+            _verify_kv_enabled(statistics)
+            and past_key_values_data is not None
+            and current_length_data is not None
+            and (
+                scope_needs_compression
+                or (
+                    verify_score_source != "scope"
+                    and _verify_kv_retain_ratio(statistics) < 0.9999
+                )
+            )
+            and not use_bootstrap_full_kv
+    ):
+        (
+            verify_past_key_values_data,
+            _verify_current_length_data,
+            verify_past_key_values,
+        ), verify_kv_source_base_offset, use_verify_kv_mask = prepare_approx_verify_cache(
+            model=model,
+            full_input_ids=input_ids,
+            past_key_values_data=past_key_values_data,
+            current_length_data=current_length_data,
+            retain_ratio=_verify_kv_retain_ratio(statistics),
+            min_retain_tokens=16,
+            statistics=statistics,
+        )
+        if verify_kv_source_base_offset is not None:
+            verify_kv_source_data = verify_past_key_values_data
+            used_approx_verify_kv = True
+        if use_verify_kv_mask:
+            used_approx_verify_kv = True
+            verify_attention_mask = _build_masked_verify_attention_mask(
+                model,
+                verify_past_key_values,
+                tree_candidates,
+            )
+    else:
+        _clear_verify_kv_mapping(model)
+        if use_bootstrap_full_kv:
+            _increment_stat(statistics, "verify_kv_bootstrap_full_uses")
+        elif (
+                _verify_kv_enabled(statistics)
+                and verify_score_source == "scope"
+                and not scope_needs_compression
+        ):
+            _increment_stat(statistics, "verify_kv_scope_full_decode_uses")
+
+    collect_verify_scores = (
+        _verify_kv_enabled(statistics)
+        and (
+            verify_score_source == "semantic"
+            or (
+                verify_score_source == "scope"
+                and (
+                    # SCOPE scores are normally collected only from full-cache
+                    # verifier passes; compressed/masked passes would bias the
+                    # next selection toward tokens that were already visible.
+                    not _verify_kv_scope_score_full_only(statistics)
+                    or not used_approx_verify_kv
+                )
+            )
+        )
+    )
+    if collect_verify_scores:
+        _start_verify_attention_collection(model)
+
+    try:
+        outputs, tree_logits = swift_verify(
+            model,
+            tree_candidates,
+            past_key_values=verify_past_key_values,
+            position_ids=position_ids,
+            attention_mask=verify_attention_mask,
+        )
+    finally:
+        if collect_verify_scores:
+            _finish_verify_attention_collection(
+                model,
+                full_len=input_ids.shape[1],
+                statistics=statistics,
+            )
+        if _verify_kv_enabled(statistics):
+            statistics["verify_kv_sample_step"] = verify_sample_step + 1
 
     logits = tree_logits[0, retrieve_indices]
 
-    return logits, outputs
+    return logits, outputs, verify_kv_source_data, verify_kv_source_base_offset, used_approx_verify_kv
 
 
 def evaluate_posterior(
@@ -1831,25 +2640,34 @@ def update_inference_inputs(
         past_key_values_data_list,
         current_length_data,
         sample_p,
+        kv_source_data_list=None,
+        kv_source_base_offset=None,
+        precommitted_kv=False,
 ):
     """
     Update the input sequences and relevant tensors based on the selected best candidate.
     """
     prev_input_len = input_ids.shape[1]
+    source_base_offset = prev_input_len if kv_source_base_offset is None else int(kv_source_base_offset)
     select_indices = (
-            retrieve_indices[best_candidate, : accept_length + 1] + prev_input_len
+            retrieve_indices[best_candidate, : accept_length + 1] + source_base_offset
     )
 
     input_ids = torch.cat(
         [input_ids, candidates[None, best_candidate, : accept_length + 1].to(input_ids.device)], dim=-1
     )
 
-    for past_key_values_data in past_key_values_data_list:
-        tgt = past_key_values_data[..., select_indices.to(past_key_values_data.device), :]
-        dst = past_key_values_data[..., prev_input_len: prev_input_len + tgt.shape[-2], :]
-        dst.copy_(tgt, non_blocking=True)
+    accepted_len = accept_length + 1
+    if precommitted_kv:
+        current_length_data.fill_(prev_input_len + accepted_len)
+    else:
+        source_data_list = kv_source_data_list if kv_source_data_list is not None else past_key_values_data_list
+        for past_key_values_data, source_past_key_values_data in zip(past_key_values_data_list, source_data_list):
+            tgt = source_past_key_values_data[..., select_indices.to(source_past_key_values_data.device), :]
+            dst = past_key_values_data[..., prev_input_len: prev_input_len + tgt.shape[-2], :]
+            dst.copy_(tgt, non_blocking=True)
 
-    current_length_data.fill_(prev_input_len + tgt.shape[-2])
+        current_length_data.fill_(prev_input_len + tgt.shape[-2])
 
     prob = sample_p
     if logits_processor is not None:
