@@ -27,11 +27,13 @@ The current evaluation script is:
 bash eval_llama_cosine_mmlu.sh
 ```
 
-The script supports MMLU, GSM8K, SAMSum, and MT-Bench through `TASK_NAME`:
+The script supports MMLU, LongGenBench-style long MMLU/GSM8K, SAMSum, and
+MT-Bench through `TASK_NAME`:
 
 ```bash
 TASK_NAME=mmlu bash eval_llama_cosine_mmlu.sh
 TASK_NAME=gsm8k bash eval_llama_cosine_mmlu.sh
+TASK_NAME=samsum bash eval_llama_cosine_mmlu.sh
 TASK_NAME=mt_bench bash eval_llama_cosine_mmlu.sh
 ```
 
@@ -45,7 +47,9 @@ DRAFT_KV_CACHE_MODE=mask      # default: use attention mask instead of KV copy
 DRAFT_KV_SCORE_SOURCE=reuse   # default: reuse previous draft attention scores
 VERIFY_KV_COMPRESS=1          # enable approximate verifier KV compression
 VERIFY_KV_CACHE_MODE=mask     # verifier masking mode; copy is also available
-VERIFY_KV_SCORE_SOURCE=reuse  # reuse draft attention scores for verifier KV
+VERIFY_KV_SCORE_SOURCE=semantic  # global verifier default; tasks may override
+VERIFY_KV_RETAIN_RATIO=0.9    # verifier ratio for non-SCOPE score sources
+VERIFY_KV_BOOTSTRAP_FULL_STEPS=1  # exact verifier steps before masking
 ```
 
 Example:
@@ -64,14 +68,16 @@ environment variables override them.  For example, `TASK_NAME=gsm8k` changes
 the default verifier score source to SCOPE, but an explicit
 `VERIFY_KV_SCORE_SOURCE=reuse` still wins.
 
-Current verifier defaults:
+Current task defaults:
 
-| Task | Verifier score source | Cache mode | Budget |
-| --- | --- | --- | --- |
-| `mmlu` | `reuse` | `mask` | `VERIFY_KV_RETAIN_RATIO=0.8` |
-| `long_mmlu` | `reuse` | `mask` | `VERIFY_KV_RETAIN_RATIO=0.8` |
-| `gsm8k` | `scope` | `mask` | `BETA1=64`, `BETA2=128` |
-| other tasks | `semantic` | `mask` | task override recommended |
+| Task | Verifier score source | Cache mode | Budget | Other defaults |
+| --- | --- | --- | --- | --- |
+| `mmlu` | `reuse` | `mask` | `VERIFY_KV_RETAIN_RATIO=0.8` | short label-scored run |
+| `long_mmlu` | `reuse` | `mask` | `VERIFY_KV_RETAIN_RATIO=0.8` | long-context variant |
+| `gsm8k` | `scope` | `mask` | `BETA1=64`, `BETA2=128` | GSM8K dynamic thresholds are tuned, but `VERIFY_KV_DYNAMIC` is still opt-in |
+| `long_gsm8k` | `semantic` | `mask` | current adaptive draft ratio | long-context variant |
+| `samsum` | `semantic` | `mask` | `VERIFY_KV_RETAIN_RATIO=0.9` | `FINAL2_ADAPTIVE=1`, `RUN_BASELINE=0`, `VERIFY_KV_BOOTSTRAP_FULL_STEPS=1`, `DATA_NUM<=819` |
+| `mt_bench` | `semantic` | `mask` | current adaptive draft ratio | `FINAL_ADAPTIVE=1`, `RUN_BASELINE=0`, `DATA_NUM<=80` |
 
 Verifier compression is enabled by default in this branch through
 `VERIFY_KV_COMPRESS=1`.  Disable it for exact verifier comparisons:
@@ -119,6 +125,9 @@ Supported score sources:
 
 - `reuse`: reuse the draft model's previous attention statistics.
 - `semantic`: use verifier attention statistics collected from verifier passes.
+  `VERIFY_KV_BOOTSTRAP_FULL_STEPS=1` is useful here because it runs the first
+  verifier step without compression, then uses the collected verifier attention
+  scores for later masked verifier KV selection.
 - `scope`: keep all prefill/prompt KV and compress only generated decoding KV.
 - `heuristic`: sink + recent + evenly sampled selection.
 - `observation`: run an extra observation forward pass to score tokens.
@@ -174,6 +183,23 @@ VERIFY_KV_COMPRESS=1 \
 bash eval_llama_cosine_mmlu.sh
 ```
 
+SAMSum default/recommended run:
+
+```bash
+TASK_NAME=samsum bash eval_llama_cosine_mmlu.sh
+```
+
+This expands to the current SAMSum default setting:
+
+```bash
+FINAL2_ADAPTIVE=1 RUN_BASELINE=0 TASK_NAME=samsum DATA_NUM=819 WRITE_LOG=1 \
+ADAPTIVE_COLD_START=1 \
+VERIFY_KV_COMPRESS=1 VERIFY_KV_CACHE_MODE=mask \
+VERIFY_KV_SCORE_SOURCE=semantic VERIFY_KV_RETAIN_RATIO=0.9 \
+VERIFY_KV_BOOTSTRAP_FULL_STEPS=1 \
+bash eval_llama_cosine_mmlu.sh
+```
+
 MT-Bench recommended speed/quality starting point:
 
 ```bash
@@ -223,6 +249,7 @@ Each `.jsonl` answer file ends with a `__summary__` record.  Useful fields:
 - `Mean accepted tokens`
 - `Token acceptance rate`
 - `Accuracy`
+- `ROUGE-1`, `ROUGE-2`, and `ROUGE-L` for SAMSum
 - `Draft KV Cache Mode`
 - `Draft KV Score Source`
 - `Adaptive Step Config Count`
